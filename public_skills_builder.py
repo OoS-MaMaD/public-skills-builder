@@ -13,8 +13,14 @@ LLM backend priority (first found wins):
   1. --provider flag  (e.g. --provider deepseek  --model deepseek-chat)
   2. DEEPSEEK_API_KEY env / .env          → api.deepseek.com
   3. OPENAI_API_KEY env / .env            → api.openai.com
-  4. ~/.local/share/opencode/auth.json    → whichever provider key is stored there
+  4. OpenCode auth file (auto-detected)   → whichever provider key is stored there
   5. OPENCODE_API_KEY env / .env          → opencode.ai/zen (free, quota-limited)
+
+OpenCode auth file locations checked (in order):
+  ~/.config/opencode/auth.json            (XDG / Linux)
+  ~/.local/share/opencode/auth.json       (older Linux builds)
+  ~/Library/Application Support/opencode/auth.json  (macOS)
+  %APPDATA%/opencode/auth.json            (Windows)
 
 Usage:
   python public_skills_builder.py [--source h1|h1-public|github|all] [--program HANDLE]
@@ -37,6 +43,7 @@ H1_API_KEY format: identifier:token
 
 import json
 import os
+import platform
 import re
 import sys
 import time
@@ -68,19 +75,40 @@ PROVIDERS = {
     "zen":        ("https://opencode.ai/zen/v1",             "OPENCODE_API_KEY",   "deepseek-v4-flash-free"),
 }
 
-# OpenCode stores provider keys here after `opencode auth login` or /connect
-OPENCODE_AUTH_FILE = Path.home() / ".local" / "share" / "opencode" / "auth.json"
+# All paths where OpenCode may store auth.json, in priority order.
+def _opencode_auth_paths() -> list[Path]:
+    home = Path.home()
+    candidates = [
+        home / ".config" / "opencode" / "auth.json",
+        home / ".local" / "share" / "opencode" / "auth.json",
+    ]
+    if platform.system() == "Darwin":
+        candidates.insert(0, home / "Library" / "Application Support" / "opencode" / "auth.json")
+    appdata = os.getenv("APPDATA", "")
+    if appdata:
+        candidates.append(Path(appdata) / "opencode" / "auth.json")
+    return candidates
 
-# Map provider names in auth.json to our PROVIDERS registry
+
+# Provider names found in OpenCode auth.json → our PROVIDERS registry.
+# OpenCode uses the provider ID from its own registry; common values listed here.
 AUTH_JSON_PROVIDER_MAP = {
-    "deepseek":   "deepseek",
-    "openai":     "openai",
-    "openrouter": "openrouter",
-    "anthropic":  None,   # not OpenAI-compatible, skip
+    # DeepSeek
+    "deepseek":            "deepseek",
+    "deepseek-api":        "deepseek",
+    # OpenAI
+    "openai":              "openai",
+    # OpenRouter
+    "openrouter":          "openrouter",
+    # Anthropic — NOT OpenAI-compatible, skip
+    "anthropic":           None,
+    # Google — skip
+    "google":              None,
+    "vertex":              None,
 }
 
 DEFAULT_CHUNK_SIZE = 10
-DEFAULT_DELAY      = 3    # seconds between LLM calls
+DEFAULT_DELAY      = 3
 MAX_DESC_CHARS     = 200
 DEBUG              = False
 
@@ -92,25 +120,54 @@ _QUOTA_EXHAUSTED   = False
 # LLM backend resolution
 # ---------------------------------------------------------------------------
 
-def _read_opencode_auth() -> dict:
-    """Parse ~/.local/share/opencode/auth.json and return {provider: api_key}."""
-    if not OPENCODE_AUTH_FILE.exists():
-        return {}
-    try:
-        raw = json.loads(OPENCODE_AUTH_FILE.read_text())
+def _read_opencode_auth() -> tuple[dict, Path | None]:
+    """
+    Scan all known OpenCode auth.json locations.
+    Returns ({provider: api_key}, path_that_was_read) or ({}, None).
+    """
+    for path in _opencode_auth_paths():
+        if not path.exists():
+            if DEBUG:
+                print(f"  [dbg] auth path not found: {path}")
+            continue
+        try:
+            raw = json.loads(path.read_text())
+        except Exception as e:
+            if DEBUG:
+                print(f"  [dbg] failed to parse {path}: {e}")
+            continue
+
+        if DEBUG:
+            print(f"  [dbg] auth.json found at: {path}")
+            # Show keys present without leaking secrets
+            top_keys = list(raw.keys()) if isinstance(raw, dict) else type(raw).__name__
+            print(f"  [dbg] auth.json top-level keys: {top_keys}")
+            if isinstance(raw, dict):
+                for k, v in raw.items():
+                    if isinstance(v, dict):
+                        print(f"  [dbg]   '{k}': dict with keys {list(v.keys())}")
+                    elif isinstance(v, str):
+                        preview = v[:6] + "..." if len(v) > 6 else "(empty)"
+                        print(f"  [dbg]   '{k}': string ({preview})")
+                    else:
+                        print(f"  [dbg]   '{k}': {type(v).__name__}")
+
         result = {}
-        for pname, pdata in raw.items():
-            if isinstance(pdata, dict):
-                key = pdata.get("key") or pdata.get("api_key") or pdata.get("token", "")
-            elif isinstance(pdata, str):
-                key = pdata
-            else:
-                continue
-            if key:
-                result[pname] = key
-        return result
-    except Exception:
-        return {}
+        if isinstance(raw, dict):
+            for pname, pdata in raw.items():
+                if isinstance(pdata, dict):
+                    # Try common key field names
+                    key = (pdata.get("key") or pdata.get("api_key") or
+                           pdata.get("token") or pdata.get("apiKey") or "")
+                elif isinstance(pdata, str):
+                    key = pdata
+                else:
+                    key = ""
+                if key:
+                    result[pname] = key
+        return result, path
+
+    return {}, None
 
 
 def resolve_backend(provider_flag: str | None, model_flag: str | None
@@ -119,10 +176,10 @@ def resolve_backend(provider_flag: str | None, model_flag: str | None
     Returns (OpenAI client, model_name, provider_label).
     Priority:
       1. --provider flag
-      2. DEEPSEEK_API_KEY
-      3. OPENAI_API_KEY
-      4. ~/.local/share/opencode/auth.json  (first usable provider)
-      5. OPENCODE_API_KEY  (Zen fallback)
+      2. DEEPSEEK_API_KEY env
+      3. OPENAI_API_KEY env
+      4. OpenCode auth.json (auto-detected path)
+      5. OPENCODE_API_KEY env  (Zen fallback)
     """
     # 1. Explicit --provider flag
     if provider_flag:
@@ -144,7 +201,7 @@ def resolve_backend(provider_flag: str | None, model_flag: str | None
             if not api_key:
                 print(f"[!] Neither {env_key} nor OPENCODE_API_KEY is set.")
                 sys.exit(1)
-        print(f"[*] LLM provider: {pname}  model: {model}  base: {base_url}")
+        print(f"[*] LLM provider: {pname}  model: {model}")
         return OpenAI(api_key=api_key, base_url=base_url), model, pname
 
     # 2. DEEPSEEK_API_KEY in env
@@ -164,16 +221,21 @@ def resolve_backend(provider_flag: str | None, model_flag: str | None
         return OpenAI(api_key=ok, base_url=base_url), model, "openai"
 
     # 4. OpenCode auth.json
-    auth_data = _read_opencode_auth()
+    auth_data, auth_path = _read_opencode_auth()
     if auth_data:
         for pname_raw, api_key in auth_data.items():
-            mapped = AUTH_JSON_PROVIDER_MAP.get(pname_raw)
+            mapped = AUTH_JSON_PROVIDER_MAP.get(pname_raw.lower())
             if mapped is None:
-                continue  # skip anthropic etc.
+                if DEBUG:
+                    print(f"  [dbg] skipping auth.json provider '{pname_raw}' (not OpenAI-compatible)")
+                continue
             base_url, _, default_model = PROVIDERS[mapped]
             model = model_flag or default_model
-            print(f"[*] LLM provider: {mapped} (from OpenCode auth.json)  model: {model}")
+            print(f"[*] LLM provider: {mapped} (from OpenCode auth.json at {auth_path})  model: {model}")
             return OpenAI(api_key=api_key, base_url=base_url), model, mapped
+    elif DEBUG and auth_path:
+        print(f"  [dbg] auth.json found at {auth_path} but no usable provider keys extracted")
+        print(f"  [dbg] Add a DeepSeek/OpenAI/OpenRouter key in OpenCode and re-run.")
 
     # 5. Zen fallback
     zen_key = os.getenv("OPENCODE_API_KEY", "")
@@ -186,12 +248,13 @@ def resolve_backend(provider_flag: str | None, model_flag: str | None
 
     # Nothing found
     print("[!] No LLM API key found. Options:")
-    print("    a) Set DEEPSEEK_API_KEY=sk-...  (recommended, cheap, no quota)")
+    print("    a) Set DEEPSEEK_API_KEY=sk-...   (recommended, cheap, no quota)")
     print("    b) Set OPENAI_API_KEY=sk-...")
-    print("    c) Set OPENCODE_API_KEY=...  (Zen, free but daily quota)")
-    print("    d) Use --provider ollama  (local, free, no key needed)")
-    print("    e) Run 'opencode' and use /connect to save a provider key,")
-    print(f"       then re-run — keys auto-loaded from {OPENCODE_AUTH_FILE}")
+    print("    c) Set OPENCODE_API_KEY=...      (Zen, free but daily quota)")
+    print("    d) Use --provider ollama         (local, free, no key needed)")
+    print("    e) In OpenCode, /connect deepseek and enter your key,")
+    print("       then re-run — it will be auto-loaded.")
+    print("    f) Run with --debug to see which auth paths were checked.")
     sys.exit(1)
 
 
@@ -555,7 +618,9 @@ def _call_llm(client: OpenAI, model: str, prompt: str, delay: int,
                     print("      a) Set DEEPSEEK_API_KEY=sk-...  (cheap, ~$0.001/call)")
                     print("      b) Set OPENROUTER_API_KEY=... and use free models")
                     print("      c) --provider ollama  (local, no quota)")
-                    print(f"      d) Keys saved by OpenCode are auto-read from {OPENCODE_AUTH_FILE}")
+                    print("      d) In OpenCode, run /connect deepseek and enter your key")
+                    print("         then re-run — key is auto-loaded.")
+                    print("      e) Run with --debug to diagnose auth.json detection.")
                 return None
 
             ra = _retry_after(e)
@@ -658,7 +723,7 @@ def parse_args():
           1. --provider flag
           2. DEEPSEEK_API_KEY env / .env
           3. OPENAI_API_KEY env / .env
-          4. ~/.local/share/opencode/auth.json  (keys saved by 'opencode /connect')
+          4. OpenCode auth.json (auto-detected: macOS, Linux XDG, Windows)
           5. OPENCODE_API_KEY  (Zen, free but has a daily quota)
 
         Provider shortcuts for --provider:
@@ -668,12 +733,18 @@ def parse_args():
           ollama     (no key needed)   → localhost:11434
           zen        OPENCODE_API_KEY  → opencode.ai/zen  (daily quota)
 
+        Quickest fix for quota errors:
+          echo 'DEEPSEEK_API_KEY=sk-...' >> .env
+          python public_skills_builder.py --source github --vuln-type xss
+
+        Debug auth.json detection:
+          python public_skills_builder.py --debug --source github --vuln-type xss
+
         Examples:
           python public_skills_builder.py --source github
           python public_skills_builder.py --source github --vuln-type xss ssrf
           python public_skills_builder.py --provider deepseek --model deepseek-chat
           python public_skills_builder.py --provider ollama --model llama3
-          python public_skills_builder.py --provider openrouter --model deepseek/deepseek-chat-v3-0324:free
           python public_skills_builder.py --chunk-size 5 --delay 2 --debug
         """),
     )
@@ -686,9 +757,10 @@ def parse_args():
     p.add_argument("--chunk-size",  type=int, default=DEFAULT_CHUNK_SIZE)
     p.add_argument("--delay",       type=int, default=DEFAULT_DELAY,
                    help=f"Seconds between LLM calls (default {DEFAULT_DELAY})")
-    p.add_argument("--provider",    help="Force a specific LLM provider (deepseek/openai/openrouter/ollama/zen)")
+    p.add_argument("--provider",    help="Force LLM provider: deepseek/openai/openrouter/ollama/zen")
     p.add_argument("--model",       help="Override model name for the selected provider")
-    p.add_argument("--debug",       action="store_true")
+    p.add_argument("--debug",       action="store_true",
+                   help="Show auth.json detection details and token counts")
     return p.parse_args()
 
 
