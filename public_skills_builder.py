@@ -48,6 +48,15 @@ H1_API_BASE  = "https://api.hackerone.com/v1"
 ZEN_BASE_URL = "https://opencode.ai/zen/v1"
 ZEN_MODEL    = "opencode/deepseek-v4-flash-free"
 
+# Max reports fed into a single LLM call.
+# deepseek-v4-flash-free has a small context window (~16k tokens input).
+# 20 reports × ~300 chars each ≈ 6k tokens prompt → leaves room for the
+# 4096-token output. Increase to 30 if you switch to a larger-context model.
+MAX_REPORTS_PER_CALL = 20
+
+# Max chars per report description fed to the LLM (keep prompt small).
+MAX_DESC_CHARS = 300
+
 
 def _api_model(model: str) -> str:
     """Strip the 'opencode/' prefix — the Zen /chat/completions endpoint doesn't want it."""
@@ -183,7 +192,7 @@ def fetch_h1_disclosed(api_key: str, program: str | None, limit: int) -> list[di
 
 def fetch_h1_hacktivity(api_key: str, limit: int, program: str | None = None) -> list[dict]:
     """
-    Fetch public disclosed reports from HackerOne’s /v1/hacktivity endpoint.
+    Fetch public disclosed reports from HackerOne's /v1/hacktivity endpoint.
     Requires H1_API_KEY (free H1 account). Returns titles, severity, weakness,
     bounty, and report URLs for all publicly disclosed reports.
     """
@@ -348,75 +357,68 @@ def group_by_vuln(reports: list[dict]) -> dict[str, list[dict]]:
 # AI Skill Generation via OpenCode Zen
 # ---------------------------------------------------------------------------
 
-SKILL_PROMPT = """You are a senior bug bounty hunter building a reusable hunting skill.
+# Compact prompt — keeps input tokens low for flash/free models.
+# The structured output sections are identical; only the preamble is trimmed.
+SKILL_PROMPT = """\
+You are a senior bug bounty hunter. Extract GENERALIZABLE hunting knowledge from the {count} {vuln_class} reports below.
 
-You will receive {count} public bug bounty reports about: **{vuln_class}**
-
-Your job is to extract GENERALIZABLE hunting knowledge — NOT to summarize individual reports.
-
-Generate a hunting skill with these exact sections:
+Write a hunting skill with these sections (markdown, no preamble):
 
 ## Crown Jewel Targets
-What makes this vuln class high-value? Where does it pay most? What asset types?
+High-value targets, asset types, what pays most.
 
 ## Attack Surface Signals
-How do you recognize this attack surface in the wild? (URL patterns, response headers, JS patterns, tech stack signals)
+URL patterns, headers, JS clues, tech stack signals that expose this surface.
 
 ## Step-by-Step Hunting Methodology
-Numbered steps. Specific. Actionable. What do you test first, second, third?
+Numbered, specific, actionable steps.
 
 ## Payload & Detection Patterns
-Concrete payloads, grep patterns, or curl commands. Format as code blocks.
+Concrete payloads or grep patterns in code blocks.
 
 ## Common Root Causes
-Why do developers introduce this bug? What shortcuts/mistakes cause it?
+Why developers introduce this bug.
 
 ## Bypass Techniques
-How do defenders try to block this, and how do hunters bypass those defenses?
+How defenses fail and how hunters get around them.
 
 ## Gate 0 Validation
-3-question test to confirm this is real before writing the report:
+3-question checklist before writing the report:
 1. What can the attacker DO right now?
 2. What does the victim LOSE?
-3. Can it be reproduced in 10 minutes from scratch?
+3. Reproducible in 10 min?
 
 ## Real Impact Examples
-2-3 anonymized attack scenarios from the reports below that show actual business impact.
+2-3 anonymized scenarios from the reports below showing business impact.
 
 Reports:
 {reports}
-
-Write the skill in clean markdown. No preamble. Start directly with ## Crown Jewel Targets.
 """
 
 
-def generate_skill(client: OpenAI, vuln_class: str, reports: list[dict]) -> str:
-    """Send grouped reports to OpenCode Zen and return the skill body."""
+def _build_report_text(reports: list[dict]) -> str:
+    """Serialize reports into a compact text block that fits flash context."""
+    lines = []
+    for i, r in enumerate(reports, 1):
+        parts = [f"[{i}] {r['title']}"]
+        if r.get("severity"):   parts.append(f"sev={r['severity']}")
+        if r.get("program"):    parts.append(f"prog={r['program']}")
+        if r.get("bounty"):     parts.append(f"${r['bounty']}")
+        if r.get("url"):        parts.append(r["url"])
+        lines.append("  ".join(parts))
 
-    report_text = ""
-    for i, r in enumerate(reports[:30], 1):
-        report_text += f"\n### Report {i}: {r['title']}\n"
-        if r.get("severity"):   report_text += f"Severity: {r['severity']}\n"
-        if r.get("weakness"):   report_text += f"Weakness: {r['weakness']}\n"
-        if r.get("program"):    report_text += f"Program: {r['program']}\n"
-        if r.get("url"):        report_text += f"URL: {r['url']}\n"
-        if r.get("bounty"):     report_text += f"Bounty: ${r['bounty']}\n"
-        if r.get("description") and len(r["description"]) > 50:
-            report_text += f"Description:\n{r['description'][:2000]}\n"
-        if r.get("impact") and len(r["impact"]) > 20:
-            report_text += f"Impact: {r['impact'][:500]}\n"
-        report_text += "\n"
+        desc = (r.get("description") or "").strip()
+        if desc and len(desc) > 30:
+            lines.append(f"  {desc[:MAX_DESC_CHARS]}")
+    return "\n".join(lines)
 
-    prompt    = SKILL_PROMPT.format(
-        vuln_class=vuln_class.replace("-", " ").upper(),
-        count=len(reports),
-        reports=report_text,
-    )
+
+def _call_zen(client: OpenAI, prompt: str) -> str | None:
+    """Single Zen API call with retry. Returns content string or None."""
     api_model = _api_model(ZEN_MODEL)
-
     for attempt in range(3):
         try:
-            resp    = client.chat.completions.create(
+            resp   = client.chat.completions.create(
                 model=api_model,
                 max_tokens=4096,
                 messages=[{"role": "user", "content": prompt}],
@@ -426,13 +428,12 @@ def generate_skill(client: OpenAI, vuln_class: str, reports: list[dict]) -> str:
             reason  = getattr(choice, "finish_reason", "unknown")
 
             if not content:
-                # Some free-tier models return None on content_filter or tool_calls finish
                 print(f"[!] Zen returned empty content (finish_reason={reason}) — retrying")
                 time.sleep(10)
                 continue
 
-            if reason not in ("stop", "length", None):
-                print(f"[~] Non-standard finish_reason: {reason}")
+            if reason == "length":
+                print(f"[~] finish_reason=length — output was truncated (this is OK, skill still usable)")
 
             return content
 
@@ -440,8 +441,80 @@ def generate_skill(client: OpenAI, vuln_class: str, reports: list[dict]) -> str:
             wait = 30 * (attempt + 1)
             print(f"[!] Zen API error (attempt {attempt + 1}): {e} — waiting {wait}s")
             time.sleep(wait)
+    return None
 
-    return f"# {vuln_class}\n\n*Skill generation failed after 3 attempts.*\n"
+
+def generate_skill(client: OpenAI, vuln_class: str, reports: list[dict]) -> str:
+    """
+    Generate skill content for a vuln class.
+
+    Strategy for large report sets (e.g. 124 XSS reports):
+      - Split into chunks of MAX_REPORTS_PER_CALL (default 20)
+      - Call Zen once per chunk → get a partial skill body
+      - If more than one chunk, do a final merge call over all partial bodies
+      - This keeps every individual prompt well within the flash context window
+    """
+    chunks = [
+        reports[i : i + MAX_REPORTS_PER_CALL]
+        for i in range(0, len(reports), MAX_REPORTS_PER_CALL)
+    ]
+
+    if len(chunks) == 1:
+        # Single chunk — straightforward
+        report_text = _build_report_text(chunks[0])
+        prompt = SKILL_PROMPT.format(
+            vuln_class=vuln_class.replace("-", " ").upper(),
+            count=len(chunks[0]),
+            reports=report_text,
+        )
+        content = _call_zen(client, prompt)
+        return content or f"# {vuln_class}\n\n*Skill generation failed.*\n"
+
+    # Multiple chunks — generate partial skills then merge
+    partials: list[str] = []
+    for idx, chunk in enumerate(chunks, 1):
+        print(f"  [*] Chunk {idx}/{len(chunks)} ({len(chunk)} reports)...")
+        report_text = _build_report_text(chunk)
+        prompt = SKILL_PROMPT.format(
+            vuln_class=vuln_class.replace("-", " ").upper(),
+            count=len(chunk),
+            reports=report_text,
+        )
+        part = _call_zen(client, prompt)
+        if part:
+            partials.append(part)
+        time.sleep(3)  # be kind to rate limits between chunks
+
+    if not partials:
+        return f"# {vuln_class}\n\n*Skill generation failed.*\n"
+
+    if len(partials) == 1:
+        return partials[0]
+
+    # Merge pass — combine all partial skills into one cohesive document
+    print(f"  [*] Merging {len(partials)} partial skills...")
+    combined = "\n\n---\n\n".join(partials)
+    merge_prompt = f"""\
+You are a senior bug bounty hunter. Below are {len(partials)} partial hunting skill drafts for **{vuln_class.upper()}**, each generated from a different batch of reports.
+
+Merge them into ONE cohesive, non-redundant hunting skill. Keep the best content from each section. Remove duplicates. Use the same section structure:
+
+## Crown Jewel Targets
+## Attack Surface Signals
+## Step-by-Step Hunting Methodology
+## Payload & Detection Patterns
+## Common Root Causes
+## Bypass Techniques
+## Gate 0 Validation
+## Real Impact Examples
+
+Start directly with ## Crown Jewel Targets. No preamble.
+
+Partial drafts:
+{combined[:6000]}
+"""
+    merged = _call_zen(client, merge_prompt)
+    return merged or partials[0]  # fallback to first partial if merge fails
 
 
 # ---------------------------------------------------------------------------
@@ -464,7 +537,7 @@ def write_skill_file(out_dir: Path, vuln_class: str, content: str, report_count:
         f"---\n"
         f"name: {name}\n"
         f"description: {description}\n"
-        f"sources: {", ".join(set(sources))}\n"
+        f"sources: {', '.join(set(sources))}\n"
         f"report_count: {report_count}\n"
         f"---\n\n"
     )
@@ -484,7 +557,7 @@ def write_index(out_dir: Path, skills: list[dict]):
         f"Generated from {sum(s['count'] for s in skills)} public reports across {len(skills)} vulnerability classes.",
         "",
         "| Skill | Reports | Sources |",
-        "|-------|---------|---------|",
+        "|-------|---------|---------| ",
     ]
     for s in sorted(skills, key=lambda x: -x["count"]):
         lines.append(f"| [{s['name']}]({s['name']}/SKILL.md) | {s['count']} | {s['sources']} |")
@@ -614,7 +687,8 @@ def main():
                 print(f"[~] Skipping {vuln_class} ({len(reports)} < min {args.min_reports})")
                 continue
 
-            print(f"\n[*] Generating skill: {vuln_class} ({len(reports)} reports)...")
+            n_chunks = max(1, (len(reports) + MAX_REPORTS_PER_CALL - 1) // MAX_REPORTS_PER_CALL)
+            print(f"\n[*] Generating skill: {vuln_class} ({len(reports)} reports, {n_chunks} chunk(s))...")
             content = generate_skill(client, vuln_class, reports)
 
             sources  = list(set(r["source"].split(":")[0] for r in reports))
