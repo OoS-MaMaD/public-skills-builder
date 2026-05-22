@@ -5,12 +5,16 @@ Fetches public disclosed bug bounty reports from HackerOne + GitHub writeup repo
 and generates OpenCode agent skill files organized by vulnerability class.
 
 Sources:
-  1. HackerOne REST API — public disclosed reports (requires H1_API_KEY)
-  2. GitHub writeup collections — awesome-bug-bounty-writeups, etc.
-  3. HackerOne hacktivity GraphQL — public disclosed reports, no auth needed
+  1. HackerOne REST API (authenticated)  — your own reports  (H1_API_KEY required)
+  2. HackerOne Hacker API /v1/hacktivity  — public disclosed  (H1_API_KEY required)
+  3. GitHub writeup collections           — no auth needed
+
+Note: HackerOne retired the unauthenticated GraphQL hacktivity endpoint in 2024.
+      Both H1 sources now require an H1_API_KEY (free H1 account + API token).
+      See: https://api.hackerone.com/hacker-resources/#hacktivity-get-hacktivity
 
 Usage:
-  python public_skills_builder.py [--source h1|github|all] [--program HANDLE]
+  python public_skills_builder.py [--source h1|h1-public|github|all] [--program HANDLE]
                                    [--vuln-type TYPE] [--limit N] [--out DIR]
 """
 
@@ -36,69 +40,78 @@ except ImportError:
 # Config
 # ---------------------------------------------------------------------------
 
-H1_API_BASE   = "https://api.hackerone.com/v1"
-H1_WEB_GQL    = "https://hackerone.com/graphql"
+H1_API_BASE  = "https://api.hackerone.com/v1"
 
-# OpenCode Zen — base URL and model ID.
-# NOTE: The model string stored here uses the "opencode/" prefix so it's human-readable
-# in logs and CLI help text. The actual API call strips the prefix (see _api_model()).
-ZEN_BASE_URL  = "https://opencode.ai/zen/v1"
-ZEN_MODEL     = "opencode/deepseek-v4-flash-free"  # free tier, good for bulk generation
+# OpenCode Zen — correct base URL.
+# NOTE: ZEN_MODEL uses "opencode/" prefix for readability in logs/CLI help.
+#       _api_model() strips it before the actual API call.
+ZEN_BASE_URL = "https://opencode.ai/zen/v1"
+ZEN_MODEL    = "opencode/deepseek-v4-flash-free"
 
 
 def _api_model(model: str) -> str:
-    """Strip the 'opencode/' prefix before sending to the Zen /chat/completions endpoint."""
+    """Strip the 'opencode/' prefix — the Zen /chat/completions endpoint doesn't want it."""
     return model.removeprefix("opencode/")
 
 
 GITHUB_WRITEUP_REPOS = [
-    ("ngalongc", "bug-bounty-reference", "README.md"),
-    ("devanshbatham", "Awesome-Bugbounty-Writeups", "README.md"),
-    ("djadmin", "awesome-bug-bounty", "README.md"),
+    ("ngalongc",      "bug-bounty-reference",         "README.md"),
+    ("devanshbatham", "Awesome-Bugbounty-Writeups",    "README.md"),
+    ("djadmin",       "awesome-bug-bounty",            "README.md"),
 ]
 
 VULN_KEYWORDS = {
-    "idor":            ["idor", "insecure direct object", "broken access control", "horizontal privilege"],
-    "ssrf":            ["ssrf", "server-side request forgery", "internal metadata"],
-    "xss":             ["xss", "cross-site scripting", "stored xss", "reflected xss", "dom xss"],
-    "sqli":            ["sql injection", "sqli", "blind sql", "error-based sql"],
-    "rce":             ["rce", "remote code execution", "command injection", "code execution"],
-    "auth-bypass":     ["authentication bypass", "auth bypass", "2fa bypass", "mfa bypass"],
-    "oauth":           ["oauth", "oidc", "jwt", "pkce", "token theft", "open redirect"],
-    "race-condition":  ["race condition", "toctou", "double-spend", "concurrent"],
-    "business-logic":  ["business logic", "price manipulation", "logic flaw", "workflow bypass"],
-    "graphql":         ["graphql", "introspection", "batching", "alias bypass"],
-    "cache-poison":    ["cache poison", "cache deception", "web cache"],
-    "xxe":             ["xxe", "xml external entity", "xml injection"],
-    "upload":          ["file upload", "unrestricted upload", "webshell", "path traversal"],
-    "ssti":            ["ssti", "server-side template", "template injection"],
-    "csrf":            ["csrf", "cross-site request forgery"],
-    "subdomain":       ["subdomain takeover", "dangling dns", "cname takeover"],
-    "llm-ai":          ["prompt injection", "llm", "ai chatbot", "indirect injection", "ascii smuggling"],
-    "crypto":          ["timing attack", "hmac", "signature bypass", "weak crypto", "replay attack"],
+    "idor":           ["idor", "insecure direct object", "broken access control", "horizontal privilege"],
+    "ssrf":           ["ssrf", "server-side request forgery", "internal metadata"],
+    "xss":            ["xss", "cross-site scripting", "stored xss", "reflected xss", "dom xss"],
+    "sqli":           ["sql injection", "sqli", "blind sql", "error-based sql"],
+    "rce":            ["rce", "remote code execution", "command injection", "code execution"],
+    "auth-bypass":    ["authentication bypass", "auth bypass", "2fa bypass", "mfa bypass"],
+    "oauth":          ["oauth", "oidc", "jwt", "pkce", "token theft", "open redirect"],
+    "race-condition": ["race condition", "toctou", "double-spend", "concurrent"],
+    "business-logic": ["business logic", "price manipulation", "logic flaw", "workflow bypass"],
+    "graphql":        ["graphql", "introspection", "batching", "alias bypass"],
+    "cache-poison":   ["cache poison", "cache deception", "web cache"],
+    "xxe":            ["xxe", "xml external entity", "xml injection"],
+    "upload":         ["file upload", "unrestricted upload", "webshell", "path traversal"],
+    "ssti":           ["ssti", "server-side template", "template injection"],
+    "csrf":           ["csrf", "cross-site request forgery"],
+    "subdomain":      ["subdomain takeover", "dangling dns", "cname takeover"],
+    "llm-ai":         ["prompt injection", "llm", "ai chatbot", "indirect injection", "ascii smuggling"],
+    "crypto":         ["timing attack", "hmac", "signature bypass", "weak crypto", "replay attack"],
 }
 
 
 # ---------------------------------------------------------------------------
-# Source 1: HackerOne REST API (authenticated, your own reports)
+# H1 auth helper
+# ---------------------------------------------------------------------------
+
+def _h1_auth(api_key: str) -> tuple[tuple[str, str], bool]:
+    """Parse H1_API_KEY and return (auth_tuple, valid)."""
+    if not api_key or ":" not in api_key:
+        return (("", ""), False)
+    identifier, token = api_key.split(":", 1)
+    return ((identifier, token), True)
+
+
+# ---------------------------------------------------------------------------
+# Source 1: HackerOne REST API — your own disclosed reports
 # ---------------------------------------------------------------------------
 
 def fetch_h1_disclosed(api_key: str, program: str | None, limit: int) -> list[dict]:
-    """Fetch publicly disclosed resolved reports via H1 REST API (requires H1_API_KEY)."""
-    if ":" not in api_key:
+    """Fetch your own publicly disclosed reports via H1 REST API."""
+    auth, valid = _h1_auth(api_key)
+    if not valid:
         print("[!] H1_API_KEY must be 'identifier:token'")
         return []
 
-    identifier, token = api_key.split(":", 1)
-    auth    = (identifier, token)
     headers = {"Accept": "application/json"}
     reports = []
     page    = 1
-
-    print(f"[*] Fetching H1 disclosed reports (limit={limit})...")
+    print(f"[*] Fetching your H1 disclosed reports (limit={limit})...")
 
     while len(reports) < limit:
-        params = {
+        params: dict = {
             "filter[state][]": ["resolved"],
             "filter[disclosed]": True,
             "page[size]": min(100, limit - len(reports)),
@@ -118,7 +131,7 @@ def fetch_h1_disclosed(api_key: str, program: str | None, limit: int) -> list[di
             break
 
         if resp.status_code == 401:
-            print("[!] H1 auth failed — check H1_API_KEY in .env")
+            print("[!] H1 auth failed — check H1_API_KEY in .env (format: identifier:token)")
             break
         if resp.status_code == 429:
             print("[*] Rate limited. Waiting 30s...")
@@ -138,16 +151,17 @@ def fetch_h1_disclosed(api_key: str, program: str | None, limit: int) -> list[di
             weakness = (rels.get("weakness", {}).get("data", {}) or {})
             severity = (rels.get("severity", {}).get("data", {}) or {})
             reports.append({
-                "source":      "hackerone",
-                "id":          item.get("id"),
-                "title":       attrs.get("title", ""),
-                "severity":    severity.get("attributes", {}).get("rating", ""),
-                "weakness":    weakness.get("attributes", {}).get("name", ""),
-                "description": attrs.get("vulnerability_information", ""),
-                "impact":      attrs.get("impact", ""),
-                "program":     rels.get("program", {}).get("data", {}).get("attributes", {}).get("handle", ""),
-                "url":         f"https://hackerone.com/reports/{item.get('id')}",
+                "source":       "hackerone",
+                "id":           item.get("id"),
+                "title":        attrs.get("title", ""),
+                "severity":     severity.get("attributes", {}).get("rating", ""),
+                "weakness":     weakness.get("attributes", {}).get("name", ""),
+                "description":  attrs.get("vulnerability_information", ""),
+                "impact":       attrs.get("impact", ""),
+                "program":      rels.get("program", {}).get("data", {}).get("attributes", {}).get("handle", ""),
+                "url":          f"https://hackerone.com/reports/{item.get('id')}",
                 "disclosed_at": attrs.get("disclosed_at", ""),
+                "bounty":       "",
             })
 
         if len(data) < 100:
@@ -155,137 +169,103 @@ def fetch_h1_disclosed(api_key: str, program: str | None, limit: int) -> list[di
         page += 1
         time.sleep(0.3)
 
-    print(f"[+] Fetched {len(reports)} H1 reports")
+    print(f"[+] Fetched {len(reports)} H1 disclosed reports")
     return reports[:limit]
 
 
 # ---------------------------------------------------------------------------
-# Source 2: HackerOne public hacktivity via GraphQL (no auth needed)
+# Source 2: HackerOne public hacktivity via REST /v1/hacktivity (auth required)
+# ---------------------------------------------------------------------------
+# NOTE: HackerOne retired their unauthenticated GraphQL hacktivity endpoint in 2024.
+# The official replacement is GET /v1/hacktivity which requires a free H1 API key.
+# Docs: https://api.hackerone.com/hacker-resources/#hacktivity-get-hacktivity
 # ---------------------------------------------------------------------------
 
-HACKTIVITY_GQL = """
-query HacktivityPageQuery(
-  $cursor: String
-  $size: Int!
-  $disclosed: Boolean
-  $orderBy: HacktivityItemOrderInput
-) {
-  hacktivity_items(
-    size: $size
-    cursor: $cursor
-    where: { disclosed: { _eq: $disclosed } }
-    order_by: $orderBy
-  ) {
-    pageInfo { endCursor hasNextPage }
-    edges {
-      node {
-        ... on HacktivityReport {
-          id
-          databaseId
-          title
-          disclosed_at
-          severity { rating }
-          weakness { name external_id }
-          reporter { username }
-          team { handle name }
-          bounty_amount
-        }
-      }
-    }
-  }
-}
-"""
-
-
-def fetch_h1_hacktivity(limit: int, program: str | None = None) -> list[dict]:
+def fetch_h1_hacktivity(api_key: str, limit: int, program: str | None = None) -> list[dict]:
     """
-    Fetch public disclosed reports from HackerOne’s hacktivity GraphQL endpoint.
-    No authentication required. Supports optional program filter via post-fetch filtering
-    (the public GQL endpoint rejects per-program filters without auth).
+    Fetch public disclosed reports from HackerOne’s /v1/hacktivity endpoint.
+    Requires H1_API_KEY (free H1 account). Returns titles, severity, weakness,
+    bounty, and report URLs for all publicly disclosed reports.
     """
-    reports = []
-    cursor  = None
-    headers = {
-        "Content-Type": "application/json",
-        "User-Agent":   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-        "X-Requested-With": "XMLHttpRequest",
-    }
+    auth, valid = _h1_auth(api_key)
+    if not valid:
+        print("[!] H1_API_KEY required for hacktivity feed (format: identifier:token)")
+        print("    Create a free API token at: https://hackerone.com/settings/api_token/edit")
+        return []
 
-    print(f"[*] Fetching H1 public hacktivity via GraphQL (limit={limit})...")
+    headers  = {"Accept": "application/json"}
+    reports  = []
+    page     = 1
+    print(f"[*] Fetching H1 public hacktivity (limit={limit})...")
 
     while len(reports) < limit:
-        variables = {
-            "size":      min(25, limit - len(reports)),
-            "disclosed": True,
-            "orderBy":   {"field": "latest_disclosable_activity_at", "direction": "DESC"},
+        params: dict = {
+            "page[size]": min(100, limit - len(reports)),
+            "page[number]": page,
+            "sort": "-disclosed_at",
         }
-        if cursor:
-            variables["cursor"] = cursor
+        if program:
+            params["filter[program][]"] = program
 
         try:
-            resp = requests.post(
-                H1_WEB_GQL,
-                headers=headers,
-                json={"query": HACKTIVITY_GQL, "variables": variables},
-                timeout=20,
+            resp = requests.get(
+                f"{H1_API_BASE}/hacktivity",
+                auth=auth, headers=headers, params=params, timeout=20
             )
         except requests.RequestException as e:
-            print(f"[!] GraphQL request error: {e}")
+            print(f"[!] Hacktivity fetch error: {e}")
             break
 
+        if resp.status_code == 401:
+            print("[!] H1 auth failed — check H1_API_KEY in .env")
+            break
+        if resp.status_code == 429:
+            print("[*] Rate limited. Waiting 30s...")
+            time.sleep(30)
+            continue
         if not resp.ok:
-            print(f"[!] GraphQL returned HTTP {resp.status_code} — skipping")
+            print(f"[!] H1 hacktivity returned {resp.status_code} — stopping")
             break
 
         body = resp.json()
-        if "errors" in body:
-            print(f"[!] GraphQL errors: {body['errors']}")
+        data = body.get("data", [])
+        if not data:
             break
 
-        items    = body.get("data", {}).get("hacktivity_items", {})
-        edges    = items.get("edges", [])
-        page_info = items.get("pageInfo", {})
-
-        if not edges:
-            break
-
-        for edge in edges:
-            node = edge.get("node", {})
-            if not node:
-                continue
-            team    = node.get("team") or {}
-            prog    = team.get("handle", "")
-            # post-fetch program filter (public GQL doesn’t accept per-program filters without auth)
-            if program and prog != program:
-                continue
-            weakness = node.get("weakness") or {}
-            severity = node.get("severity") or {}
-            rid      = node.get("databaseId") or node.get("id", "")
+        for item in data:
+            attrs    = item.get("attributes", {})
+            rels     = item.get("relationships", {})
+            weakness = (rels.get("weakness",  {}).get("data", {}) or {})
+            severity = (rels.get("severity",  {}).get("data", {}) or {})
+            team     = (rels.get("team",      {}).get("data", {}) or {})
+            bounty   = (rels.get("bounty",    {}).get("data", {}) or {})
+            rid      = item.get("id", "")
             reports.append({
-                "source":      "hackerone_public",
-                "id":          str(rid),
-                "title":       node.get("title", ""),
-                "severity":    severity.get("rating", ""),
-                "weakness":    weakness.get("name", ""),
-                "description": "",
-                "impact":      "",
-                "program":     prog,
-                "url":         f"https://hackerone.com/reports/{rid}",
-                "disclosed_at": node.get("disclosed_at", ""),
-                "bounty":      node.get("bounty_amount", ""),
+                "source":       "hackerone_public",
+                "id":           str(rid),
+                "title":        attrs.get("title", ""),
+                "severity":     severity.get("attributes", {}).get("rating", ""),
+                "weakness":     weakness.get("attributes", {}).get("name", ""),
+                "description":  attrs.get("vulnerability_information", ""),
+                "impact":       attrs.get("impact", ""),
+                "program":      team.get("attributes", {}).get("handle", ""),
+                "url":          f"https://hackerone.com/reports/{rid}",
+                "disclosed_at": attrs.get("disclosed_at", ""),
+                "bounty":       bounty.get("attributes", {}).get("amount", ""),
             })
 
-        if not page_info.get("hasNextPage"):
+        # pagination: stop when fewer results than page size
+        if len(data) < params["page[size]"]:
             break
-        cursor = page_info.get("endCursor")
-        time.sleep(0.5)
+        page += 1
+        time.sleep(0.4)
 
     print(f"[+] Fetched {len(reports)} public hacktivity reports")
     return reports[:limit]
 
 
 # ---------------------------------------------------------------------------
-# Source 3: GitHub writeup collections
+# Source 3: GitHub writeup collections (no auth needed)
 # ---------------------------------------------------------------------------
 
 def fetch_github_writeups(limit: int) -> list[dict]:
@@ -313,8 +293,7 @@ def fetch_github_writeups(limit: int) -> list[dict]:
         except requests.RequestException:
             continue
 
-        content = resp.text
-        links   = re.findall(r'\[([^\]]+)\]\((https?://[^\)]+)\)', content)
+        links = re.findall(r'\[([^\]]+)\]\((https?://[^\)]+)\)', resp.text)
 
         for title, link_url in links:
             if len(reports) >= limit:
@@ -323,18 +302,18 @@ def fetch_github_writeups(limit: int) -> list[dict]:
                 "medium.com", "infosec", "writeup", "hackerone.com/reports",
                 "blog", "notion.so", "github.io", "portswigger", "bugcrowd"
             ]):
-                vuln_class = classify_report(title, "")
                 reports.append({
-                    "source":      f"github:{owner}/{repo}",
-                    "id":          re.sub(r'[^a-z0-9]', '-', title.lower())[:40],
-                    "title":       title,
-                    "severity":    "",
-                    "weakness":    vuln_class,
-                    "description": f"Public writeup: {title}",
-                    "impact":      "",
-                    "program":     "",
-                    "url":         link_url,
+                    "source":       f"github:{owner}/{repo}",
+                    "id":           re.sub(r'[^a-z0-9]', '-', title.lower())[:40],
+                    "title":        title,
+                    "severity":     "",
+                    "weakness":     classify_report(title, ""),
+                    "description":  f"Public writeup: {title}",
+                    "impact":       "",
+                    "program":      "",
+                    "url":          link_url,
                     "disclosed_at": "",
+                    "bounty":       "",
                 })
 
         print(f"[+] {owner}/{repo}: {len(links)} links found")
@@ -349,7 +328,6 @@ def fetch_github_writeups(limit: int) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def classify_report(title: str, weakness: str) -> str:
-    """Map a report to a vuln class based on title + weakness name."""
     text = (title + " " + weakness).lower()
     for vuln_class, keywords in VULN_KEYWORDS.items():
         if any(kw in text for kw in keywords):
@@ -358,7 +336,6 @@ def classify_report(title: str, weakness: str) -> str:
 
 
 def group_by_vuln(reports: list[dict]) -> dict[str, list[dict]]:
-    """Group reports by vuln class."""
     groups: dict[str, list[dict]] = defaultdict(list)
     for r in reports:
         cls = classify_report(r["title"], r.get("weakness", ""))
@@ -414,50 +391,67 @@ Write the skill in clean markdown. No preamble. Start directly with ## Crown Jew
 
 
 def generate_skill(client: OpenAI, vuln_class: str, reports: list[dict]) -> str:
-    """Send grouped reports to OpenCode Zen and return a hunting skill."""
+    """Send grouped reports to OpenCode Zen and return the skill body."""
 
     report_text = ""
     for i, r in enumerate(reports[:30], 1):
         report_text += f"\n### Report {i}: {r['title']}\n"
-        if r.get("severity"):    report_text += f"Severity: {r['severity']}\n"
-        if r.get("weakness"):    report_text += f"Weakness: {r['weakness']}\n"
-        if r.get("program"):     report_text += f"Program: {r['program']}\n"
-        if r.get("url"):         report_text += f"URL: {r['url']}\n"
-        if r.get("bounty"):      report_text += f"Bounty: ${r['bounty']}\n"
+        if r.get("severity"):   report_text += f"Severity: {r['severity']}\n"
+        if r.get("weakness"):   report_text += f"Weakness: {r['weakness']}\n"
+        if r.get("program"):    report_text += f"Program: {r['program']}\n"
+        if r.get("url"):        report_text += f"URL: {r['url']}\n"
+        if r.get("bounty"):     report_text += f"Bounty: ${r['bounty']}\n"
         if r.get("description") and len(r["description"]) > 50:
             report_text += f"Description:\n{r['description'][:2000]}\n"
         if r.get("impact") and len(r["impact"]) > 20:
             report_text += f"Impact: {r['impact'][:500]}\n"
         report_text += "\n"
 
-    prompt = SKILL_PROMPT.format(
+    prompt    = SKILL_PROMPT.format(
         vuln_class=vuln_class.replace("-", " ").upper(),
         count=len(reports),
         reports=report_text,
     )
-
     api_model = _api_model(ZEN_MODEL)
 
     for attempt in range(3):
         try:
-            resp = client.chat.completions.create(
+            resp    = client.chat.completions.create(
                 model=api_model,
                 max_tokens=4096,
                 messages=[{"role": "user", "content": prompt}],
             )
-            return resp.choices[0].message.content
+            choice  = resp.choices[0]
+            content = choice.message.content
+            reason  = getattr(choice, "finish_reason", "unknown")
+
+            if not content:
+                # Some free-tier models return None on content_filter or tool_calls finish
+                print(f"[!] Zen returned empty content (finish_reason={reason}) — retrying")
+                time.sleep(10)
+                continue
+
+            if reason not in ("stop", "length", None):
+                print(f"[~] Non-standard finish_reason: {reason}")
+
+            return content
+
         except Exception as e:
             wait = 30 * (attempt + 1)
             print(f"[!] Zen API error (attempt {attempt + 1}): {e} — waiting {wait}s")
             time.sleep(wait)
 
-    return f"# {vuln_class}\n\n*Generation failed after 3 attempts. Try again.*\n"
+    return f"# {vuln_class}\n\n*Skill generation failed after 3 attempts.*\n"
 
 
-def write_skill_file(out_dir: Path, vuln_class: str, content: str, report_count: int, sources: list[str]):
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
+def write_skill_file(out_dir: Path, vuln_class: str, content: str, report_count: int, sources: list[str]) -> Path:
     """
-    Write a SKILL.md in OpenCode agent skill format.
-    Directory: <out_dir>/hunt-<vuln>/SKILL.md
+    Write SKILL.md in OpenCode agent skill format.
+    Path: <out_dir>/hunt-<vuln>/SKILL.md
     """
     name = f"hunt-{vuln_class.lower().replace(' ', '-').replace('_', '-')}"
     description = (
@@ -466,24 +460,24 @@ def write_skill_file(out_dir: Path, vuln_class: str, content: str, report_count:
         f"Use when hunting {vuln_class.replace('-', ' ')} on any target."
     )[:300]
 
-    frontmatter = f"""---
-name: {name}
-description: {description}
-sources: {", ".join(set(sources))}
-report_count: {report_count}
----
+    frontmatter = (
+        f"---\n"
+        f"name: {name}\n"
+        f"description: {description}\n"
+        f"sources: {", ".join(set(sources))}\n"
+        f"report_count: {report_count}\n"
+        f"---\n\n"
+    )
 
-"""
     skill_dir = out_dir / name
     skill_dir.mkdir(parents=True, exist_ok=True)
-    filepath = skill_dir / "SKILL.md"
+    filepath  = skill_dir / "SKILL.md"
     filepath.write_text(frontmatter + content, encoding="utf-8")
-    print(f"[+] Written: {filepath}  ({report_count} reports)")
+    print(f"[+] Written: {filepath}  ({report_count} reports, {len(content)} chars)")
     return filepath
 
 
 def write_index(out_dir: Path, skills: list[dict]):
-    """Write a README index of all generated skills."""
     lines = [
         "# Public Bug Bounty Skills",
         "",
@@ -499,19 +493,18 @@ def write_index(out_dir: Path, skills: list[dict]):
         "",
         "## Usage with OpenCode",
         "```bash",
-        "# Copy to global OpenCode config (available in all projects)",
+        "# Global (available in all projects)",
         "cp -r skills/hunt-idor ~/.config/opencode/skills/",
         "",
-        "# Or project-local",
+        "# Project-local",
         "cp -r skills/hunt-ssrf .opencode/skills/",
         "```",
         "",
-        "## Usage with Claude Code (compatible — same Agent Skills format)",
+        "## Usage with Claude Code (same Agent Skills format)",
         "```bash",
         "cp -r skills/hunt-idor .claude/skills/",
         "```",
     ]
-
     (out_dir / "README.md").write_text("\n".join(lines), encoding="utf-8")
     print(f"[+] Index written: {out_dir}/README.md")
 
@@ -526,28 +519,27 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""
         Examples:
-          python public_skills_builder.py                             # all sources
-          python public_skills_builder.py --source github            # GitHub only (fastest, no keys)
-          python public_skills_builder.py --source h1-public         # H1 GraphQL public feed
-          python public_skills_builder.py --vuln-type idor ssrf xss  # specific classes
+          python public_skills_builder.py                              # all sources
+          python public_skills_builder.py --source github             # no API keys needed
+          python public_skills_builder.py --source h1-public          # H1 hacktivity (needs H1_API_KEY)
+          python public_skills_builder.py --source h1 --program shopify
+          python public_skills_builder.py --vuln-type idor ssrf xss
           python public_skills_builder.py --model opencode/big-pickle
         """),
     )
-    p.add_argument("--source", choices=["h1", "h1-public", "github", "all"], default="all")
-    p.add_argument("--program", help="H1 program handle filter (e.g. shopify)")
-    p.add_argument("--vuln-type", nargs="+", choices=list(VULN_KEYWORDS.keys()),
+    p.add_argument("--source",      choices=["h1", "h1-public", "github", "all"], default="all")
+    p.add_argument("--program",     help="H1 program handle filter (e.g. shopify)")
+    p.add_argument("--vuln-type",   nargs="+", choices=list(VULN_KEYWORDS.keys()),
                    help="Only generate skills for these vuln classes")
-    p.add_argument("--limit", type=int, default=500, help="Max reports to fetch (default: 500)")
-    p.add_argument("--out",   default="skills", help="Output directory (default: skills/)")
-    p.add_argument("--min-reports", type=int, default=3,
-                   help="Min reports per class to generate a skill (default: 3)")
-    p.add_argument("--model", default=ZEN_MODEL,
-                   help=f"OpenCode Zen model (default: {ZEN_MODEL}). Free options: opencode/deepseek-v4-flash-free, opencode/big-pickle, opencode/nemotron-3-super-free")
+    p.add_argument("--limit",       type=int, default=500)
+    p.add_argument("--out",         default="skills")
+    p.add_argument("--min-reports", type=int, default=3)
+    p.add_argument("--model",       default=ZEN_MODEL,
+                   help=f"Zen model ID (default: {ZEN_MODEL}). Other free options: opencode/big-pickle, opencode/nemotron-3-super-free")
     return p.parse_args()
 
 
 def load_env():
-    """Load .env file if present."""
     env_file = Path(".env")
     if env_file.exists():
         for line in env_file.read_text().splitlines():
@@ -574,27 +566,32 @@ def main():
     ZEN_MODEL = args.model
 
     client = OpenAI(api_key=opencode_key, base_url=ZEN_BASE_URL)
-
-    print(f"[*] Using model: {ZEN_MODEL} (API: {_api_model(ZEN_MODEL)}) via OpenCode Zen")
+    print(f"[*] Using model: {ZEN_MODEL} (API id: {_api_model(ZEN_MODEL)}) via OpenCode Zen")
 
     # --- Fetch ---
     all_reports: list[dict] = []
+    h1_key = os.getenv("H1_API_KEY", "")
+
     try:
         if args.source in ("h1", "all"):
-            h1_key = os.getenv("H1_API_KEY", "")
             if h1_key:
                 all_reports += fetch_h1_disclosed(h1_key, args.program, args.limit)
             else:
-                print("[!] H1_API_KEY not set — skipping private H1 reports")
+                print("[!] H1_API_KEY not set — skipping personal H1 reports")
 
         if args.source in ("h1-public", "all"):
-            all_reports += fetch_h1_hacktivity(args.limit, args.program)
+            if h1_key:
+                all_reports += fetch_h1_hacktivity(h1_key, args.limit, args.program)
+            else:
+                print("[!] H1_API_KEY not set — skipping H1 hacktivity feed")
+                print("    HackerOne retired the unauthenticated feed. A free API key is now required.")
+                print("    Create one at: https://hackerone.com/settings/api_token/edit")
 
         if args.source in ("github", "all"):
             all_reports += fetch_github_writeups(args.limit // 2)
 
     except KeyboardInterrupt:
-        print("\n[*] Interrupted during fetch. Proceeding with collected reports...")
+        print("\n[*] Interrupted during fetch. Proceeding with what was collected...")
 
     if not all_reports:
         print("[!] No reports collected. Check your API keys and source settings.")
@@ -609,12 +606,12 @@ def main():
 
     print(f"[*] Vuln classes found: {', '.join(f'{k}({len(v)})' for k, v in sorted(groups.items(), key=lambda x: -len(x[1])))}")
 
-    # --- Generate ---
-    skills_written = []
+    # --- Generate skills ---
+    skills_written: list[dict] = []
     try:
         for vuln_class, reports in sorted(groups.items(), key=lambda x: -len(x[1])):
             if len(reports) < args.min_reports:
-                print(f"[~] Skipping {vuln_class} ({len(reports)} reports < min {args.min_reports})")
+                print(f"[~] Skipping {vuln_class} ({len(reports)} < min {args.min_reports})")
                 continue
 
             print(f"\n[*] Generating skill: {vuln_class} ({len(reports)} reports)...")
@@ -636,7 +633,7 @@ def main():
     if skills_written:
         write_index(out_dir, skills_written)
         print(f"\n[+] Done. {len(skills_written)} skills written to {out_dir}/")
-        print(f"[*] To use globally in OpenCode:")
+        print(f"[*] To install globally in OpenCode:")
         print(f"    cp -r {out_dir}/* ~/.config/opencode/skills/")
     else:
         print("[!] No skills generated.")
