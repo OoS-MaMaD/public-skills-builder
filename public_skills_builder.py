@@ -2,7 +2,7 @@
 """
 Public Skills Builder
 Fetches public disclosed bug bounty reports from HackerOne + GitHub writeup repos
-and generates Claude AI skill files organized by vulnerability class.
+and generates OpenCode agent skill files organized by vulnerability class.
 
 Sources:
   1. HackerOne REST API — public disclosed reports (requires API key)
@@ -26,9 +26,9 @@ from pathlib import Path
 from collections import defaultdict
 
 try:
-    import anthropic
+    from openai import OpenAI
 except ImportError:
-    print("[!] Missing: pip install anthropic requests")
+    print("[!] Missing: pip install openai requests")
     sys.exit(1)
 
 
@@ -38,6 +38,10 @@ except ImportError:
 
 H1_API_BASE   = "https://api.hackerone.com/v1"
 H1_WEB_GQL    = "https://hackerone.com/graphql"
+
+# OpenCode Zen config
+ZEN_BASE_URL  = "https://api.opencode.ai/v1"
+ZEN_MODEL     = "opencode/deepseek-v4-flash-free"
 
 GITHUB_WRITEUP_REPOS = [
     # (owner, repo, path_to_writeups_list_or_readme)
@@ -76,7 +80,6 @@ def fetch_h1_disclosed(api_key: str, program: str | None, limit: int) -> list[di
     """
     Fetch publicly disclosed resolved reports via H1 REST API.
     Requires a free H1 account API key.
-    Endpoint: GET /v1/hackers/me/reports (own) or program-specific disclosed.
     """
     if ":" not in api_key:
         print("[!] H1_API_KEY must be 'identifier:token'")
@@ -92,11 +95,11 @@ def fetch_h1_disclosed(api_key: str, program: str | None, limit: int) -> list[di
 
     while len(reports) < limit:
         params = {
-            "filter[state][]":     ["resolved"],
-            "filter[disclosed]":   True,
-            "page[size]":          min(100, limit - len(reports)),
-            "page[number]":        page,
-            "sort":                "-created_at",
+            "filter[state][]": ["resolved"],
+            "filter[disclosed]": True,
+            "page[size]": min(100, limit - len(reports)),
+            "page[number]": page,
+            "sort": "-created_at",
         }
         if program:
             params["filter[program][]"] = program
@@ -165,7 +168,6 @@ def fetch_h1_disclosed(api_key: str, program: str | None, limit: int) -> list[di
 def fetch_h1_hacktivity(limit: int, program: str | None = None) -> list[dict]:
     """
     Fetch public hacktivity from HackerOne's web GraphQL (no auth).
-    Returns disclosed reports from the public feed.
     """
     reports = []
     cursor = None
@@ -176,32 +178,6 @@ def fetch_h1_hacktivity(limit: int, program: str | None = None) -> list[dict]:
 
     print(f"[*] Fetching H1 public hacktivity feed (limit={limit})...")
 
-    query = """
-    query HacktivityFeed($after: String, $program: [String]) {
-      hacktivity: reports(
-        filter: {
-          reporter: [],
-          disclosed_at__lt: "2099-01-01"
-          program: $program
-        }
-        first: 25
-        after: $after
-        order_by: {field: disclosed_at, direction: DESC}
-      ) {
-        pageInfo { hasNextPage endCursor }
-        nodes {
-          id
-          title
-          disclosed_at
-          severity { rating }
-          weakness { name }
-          team { handle name }
-        }
-      }
-    }
-    """
-
-    # Fallback: use the simpler public endpoint
     simple_query = """
     query {
       reports(filter: {reporter: [], disclosed_at__lt: "2099-01-01"}, first: 25) {
@@ -217,10 +193,6 @@ def fetch_h1_hacktivity(limit: int, program: str | None = None) -> list[dict]:
     """
 
     while len(reports) < limit:
-        variables = {"after": cursor}
-        if program:
-            variables["program"] = [program]
-
         try:
             resp = requests.post(
                 H1_WEB_GQL,
@@ -252,7 +224,7 @@ def fetch_h1_hacktivity(limit: int, program: str | None = None) -> list[dict]:
                     "title":       node.get("title", ""),
                     "severity":    node.get("severity", {}).get("rating", "") if node.get("severity") else "",
                     "weakness":    node.get("weakness", {}).get("name", "") if node.get("weakness") else "",
-                    "description": "",  # public feed doesn't include body
+                    "description": "",
                     "impact":      "",
                     "program":     node.get("team", {}).get("handle", "") if node.get("team") else "",
                     "url":         f"https://hackerone.com/reports/{node.get('id')}",
@@ -276,7 +248,6 @@ def fetch_h1_hacktivity(limit: int, program: str | None = None) -> list[dict]:
 def fetch_github_writeups(limit: int) -> list[dict]:
     """
     Parse awesome writeup repos from GitHub and extract report links + titles.
-    No auth needed for public repos.
     """
     github_token = os.getenv("GITHUB_TOKEN", "")
     headers = {"User-Agent": "public-skills-builder"}
@@ -291,7 +262,6 @@ def fetch_github_writeups(limit: int) -> list[dict]:
         try:
             resp = requests.get(url, headers=headers, timeout=15)
             if not resp.ok:
-                # try main branch
                 resp = requests.get(
                     url.replace("/master/", "/main/"),
                     headers=headers, timeout=15
@@ -303,13 +273,11 @@ def fetch_github_writeups(limit: int) -> list[dict]:
             continue
 
         content = resp.text
-        # Extract markdown links: [title](url)
         links = re.findall(r'\[([^\]]+)\]\((https?://[^\)]+)\)', content)
 
         for title, link_url in links:
             if len(reports) >= limit:
                 break
-            # Only keep writeup URLs (not repo links or docs)
             if any(kw in link_url.lower() for kw in [
                 "medium.com", "infosec", "writeup", "hackerone.com/reports",
                 "blog", "notion.so", "github.io", "portswigger", "bugcrowd"
@@ -359,7 +327,7 @@ def group_by_vuln(reports: list[dict]) -> dict[str, list[dict]]:
 
 
 # ---------------------------------------------------------------------------
-# AI Skill Generation
+# AI Skill Generation (OpenCode Zen — deepseek-v4-flash-free)
 # ---------------------------------------------------------------------------
 
 SKILL_PROMPT = """You are a senior bug bounty hunter building a reusable hunting skill.
@@ -404,10 +372,9 @@ Write the skill in clean markdown. No preamble. Start directly with ## Crown Jew
 """
 
 
-def generate_skill(client: anthropic.Anthropic, vuln_class: str, reports: list[dict]) -> str:
-    """Send grouped reports to Claude and get a skill file back."""
+def generate_skill(client: OpenAI, vuln_class: str, reports: list[dict]) -> str:
+    """Send grouped reports to OpenCode Zen (deepseek-v4-flash-free) and get a skill back."""
 
-    # Build report summaries (no PII/URLs redacted for public reports)
     report_text = ""
     for i, r in enumerate(reports[:30], 1):  # cap at 30 per skill
         report_text += f"\n### Report {i}: {r['title']}\n"
@@ -434,34 +401,26 @@ def generate_skill(client: anthropic.Anthropic, vuln_class: str, reports: list[d
 
     for attempt in range(3):
         try:
-            msg = client.messages.create(
-                model="claude-sonnet-4-6",
+            resp = client.chat.completions.create(
+                model=ZEN_MODEL,
                 max_tokens=4096,
                 messages=[{"role": "user", "content": prompt}],
             )
-            return msg.content[0].text
-        except anthropic.RateLimitError:
+            return resp.choices[0].message.content
+        except Exception as e:
             wait = 30 * (attempt + 1)
-            print(f"[*] Rate limited, waiting {wait}s...")
+            print(f"[!] Zen API error (attempt {attempt + 1}): {e} — waiting {wait}s")
             time.sleep(wait)
-        except anthropic.APIError as e:
-            print(f"[!] Claude API error: {e}")
-            break
 
     return f"# {vuln_class}\n\n*Generation failed. Try again.*\n"
 
 
 def write_skill_file(out_dir: Path, vuln_class: str, content: str, report_count: int, sources: list[str]):
-    """Write a skill file with YAML frontmatter."""
-    # Extract a one-liner description from the content
-    first_line = ""
-    for line in content.split("\n"):
-        line = line.strip()
-        if line and not line.startswith("#") and len(line) > 30:
-            first_line = line[:120]
-            break
-
-    name = vuln_class.lower().replace(" ", "-").replace("_", "-")
+    """
+    Write a skill file in OpenCode agent skill format.
+    Output: <out_dir>/hunt-<vuln>/SKILL.md with YAML frontmatter.
+    """
+    name = f"hunt-{vuln_class.lower().replace(' ', '-').replace('_', '-')}"
     description = (
         f"Hunting skill for {vuln_class.replace('-', ' ')} vulnerabilities. "
         f"Built from {report_count} public bug bounty reports. "
@@ -469,16 +428,19 @@ def write_skill_file(out_dir: Path, vuln_class: str, content: str, report_count:
     )[:300]
 
     frontmatter = f"""---
-name: hunt-{name}
+name: {name}
 description: {description}
 sources: {", ".join(set(sources))}
 report_count: {report_count}
 ---
 
 """
-    filepath = out_dir / f"hunt-{name}.md"
+    # OpenCode skill directory structure: <out_dir>/<name>/SKILL.md
+    skill_dir = out_dir / name
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    filepath = skill_dir / "SKILL.md"
     filepath.write_text(frontmatter + content, encoding="utf-8")
-    print(f"[+] Written: {filepath.name} ({report_count} reports)")
+    print(f"[+] Written: {filepath} ({report_count} reports)")
     return filepath
 
 
@@ -493,17 +455,23 @@ def write_index(out_dir: Path, skills: list[dict]):
         "|-------|---------|---------|",
     ]
     for s in sorted(skills, key=lambda x: -x["count"]):
-        lines.append(f"| [{s['name']}]({s['file']}) | {s['count']} | {s['sources']} |")
+        lines.append(f"| [{s['name']}]({s['name']}/SKILL.md) | {s['count']} | {s['sources']} |")
 
     lines += [
         "",
-        "## Usage with Claude Code",
+        "## Usage with OpenCode",
         "```bash",
-        "# Load a skill",
-        "cat skills/hunt-idor.md | claude",
+        "# Copy skills to global OpenCode config for use across all projects",
+        "cp -r skills/hunt-idor ~/.config/opencode/skills/",
         "",
-        "# Or reference in your CLAUDE.md",
-        "cat skills/hunt-ssrf.md >> ~/.claude/CLAUDE.md",
+        "# Or load project-locally",
+        "cp -r skills/hunt-ssrf .opencode/skills/",
+        "```",
+        "",
+        "## Usage with Claude Code (also compatible)",
+        "```bash",
+        "# Skills use the shared Agent Skills format — works in both tools",
+        "cp -r skills/hunt-idor .claude/skills/",
         "```",
     ]
 
@@ -517,7 +485,7 @@ def write_index(out_dir: Path, skills: list[dict]):
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Build Claude AI hunting skills from public bug bounty reports",
+        description="Build OpenCode agent hunting skills from public bug bounty reports",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""
         Examples:
@@ -542,6 +510,8 @@ def parse_args():
     p.add_argument("--out", default="skills", help="Output directory (default: skills/)")
     p.add_argument("--min-reports", type=int, default=3,
                    help="Min reports per class to generate a skill (default: 3)")
+    p.add_argument("--model", default=ZEN_MODEL,
+                   help=f"OpenCode Zen model to use (default: {ZEN_MODEL})")
     return p.parse_args()
 
 
@@ -560,15 +530,25 @@ def main():
     load_env()
     args = parse_args()
 
-    anthropic_key = os.getenv("ANTHROPIC_API_KEY")
-    if not anthropic_key:
-        print("[!] Set ANTHROPIC_API_KEY in .env or environment")
+    opencode_key = os.getenv("OPENCODE_API_KEY")
+    if not opencode_key:
+        print("[!] Set OPENCODE_API_KEY in .env or environment")
+        print("    Get your key at: https://opencode.ai/zen")
         sys.exit(1)
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    client = anthropic.Anthropic(api_key=anthropic_key)
+    # Override model if passed via --model flag
+    global ZEN_MODEL
+    ZEN_MODEL = args.model
+
+    client = OpenAI(
+        api_key=opencode_key,
+        base_url=ZEN_BASE_URL,
+    )
+
+    print(f"[*] Using model: {ZEN_MODEL} via OpenCode Zen")
 
     # --- Fetch reports ---
     all_reports: list[dict] = []
@@ -624,7 +604,7 @@ def main():
                 "count":   len(reports),
                 "sources": ", ".join(sources),
             })
-            time.sleep(1)  # be nice to the API
+            time.sleep(1)
 
     except KeyboardInterrupt:
         print("\n[*] Interrupted. Saving index for skills generated so far...")
@@ -632,6 +612,8 @@ def main():
     if skills_written:
         write_index(out_dir, skills_written)
         print(f"\n[+] Done. {len(skills_written)} skills written to {out_dir}/")
+        print(f"\n[*] To use in OpenCode:")
+        print(f"    cp -r {out_dir}/* ~/.config/opencode/skills/")
     else:
         print("[!] No skills generated.")
 
