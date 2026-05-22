@@ -91,8 +91,11 @@ def _opencode_auth_paths() -> list[Path]:
 
 
 # Provider names found in OpenCode auth.json → our PROVIDERS registry.
-# OpenCode uses the provider ID from its own registry; common values listed here.
+# "opencode" is the key OpenCode stores its own Zen/opencode.ai key under.
 AUTH_JSON_PROVIDER_MAP = {
+    # OpenCode's own Zen key — stored as "opencode" by `opencode auth` / /connect
+    "opencode":            "zen",
+    "opencode-ai":         "zen",
     # DeepSeek
     "deepseek":            "deepseek",
     "deepseek-api":        "deepseek",
@@ -100,9 +103,8 @@ AUTH_JSON_PROVIDER_MAP = {
     "openai":              "openai",
     # OpenRouter
     "openrouter":          "openrouter",
-    # Anthropic — NOT OpenAI-compatible, skip
+    # Not OpenAI-compatible — skip
     "anthropic":           None,
-    # Google — skip
     "google":              None,
     "vertex":              None,
 }
@@ -139,7 +141,6 @@ def _read_opencode_auth() -> tuple[dict, Path | None]:
 
         if DEBUG:
             print(f"  [dbg] auth.json found at: {path}")
-            # Show keys present without leaking secrets
             top_keys = list(raw.keys()) if isinstance(raw, dict) else type(raw).__name__
             print(f"  [dbg] auth.json top-level keys: {top_keys}")
             if isinstance(raw, dict):
@@ -156,7 +157,6 @@ def _read_opencode_auth() -> tuple[dict, Path | None]:
         if isinstance(raw, dict):
             for pname, pdata in raw.items():
                 if isinstance(pdata, dict):
-                    # Try common key field names
                     key = (pdata.get("key") or pdata.get("api_key") or
                            pdata.get("token") or pdata.get("apiKey") or "")
                 elif isinstance(pdata, str):
@@ -235,14 +235,13 @@ def resolve_backend(provider_flag: str | None, model_flag: str | None
             return OpenAI(api_key=api_key, base_url=base_url), model, mapped
     elif DEBUG and auth_path:
         print(f"  [dbg] auth.json found at {auth_path} but no usable provider keys extracted")
-        print(f"  [dbg] Add a DeepSeek/OpenAI/OpenRouter key in OpenCode and re-run.")
 
-    # 5. Zen fallback
+    # 5. Zen fallback via env
     zen_key = os.getenv("OPENCODE_API_KEY", "")
     if zen_key:
         base_url, _, default_model = PROVIDERS["zen"]
         model = model_flag or default_model
-        print(f"[*] LLM provider: zen (fallback)  model: {model}")
+        print(f"[*] LLM provider: zen (env)  model: {model}")
         print(f"    [~] Zen has a daily free quota. For unlimited use, set DEEPSEEK_API_KEY.")
         return OpenAI(api_key=zen_key, base_url=base_url), model, "zen"
 
@@ -620,7 +619,6 @@ def _call_llm(client: OpenAI, model: str, prompt: str, delay: int,
                     print("      c) --provider ollama  (local, no quota)")
                     print("      d) In OpenCode, run /connect deepseek and enter your key")
                     print("         then re-run — key is auto-loaded.")
-                    print("      e) Run with --debug to diagnose auth.json detection.")
                 return None
 
             ra = _retry_after(e)
@@ -696,7 +694,7 @@ def write_index(out_dir: Path, skills: list[dict]):
     lines = [
         "# Public Bug Bounty Skills", "",
         f"Generated from {sum(s['count'] for s in skills)} reports across {len(skills)} vuln classes.",
-        "", "| Skill | Reports | Sources |", "|-------|---------|---------|",
+        "", "| Skill | Reports | Sources |", "|-------|---------|---------| ",
     ]
     for s in sorted(skills, key=lambda x: -x["count"]):
         lines.append(f"| [{s['name']}]({s['name']}/SKILL.md) | {s['count']} | {s['sources']} |")
