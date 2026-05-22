@@ -39,8 +39,8 @@ except ImportError:
 H1_API_BASE   = "https://api.hackerone.com/v1"
 H1_WEB_GQL    = "https://hackerone.com/graphql"
 
-# OpenCode Zen config
-ZEN_BASE_URL  = "https://api.opencode.ai/v1"
+# OpenCode Zen — correct base URL is opencode.ai/zen/v1
+ZEN_BASE_URL  = "https://opencode.ai/zen/v1"
 ZEN_MODEL     = "opencode/deepseek-v4-flash-free"
 
 GITHUB_WRITEUP_REPOS = [
@@ -167,74 +167,77 @@ def fetch_h1_disclosed(api_key: str, program: str | None, limit: int) -> list[di
 
 def fetch_h1_hacktivity(limit: int, program: str | None = None) -> list[dict]:
     """
-    Fetch public hacktivity from HackerOne's web GraphQL (no auth).
+    Fetch public disclosed reports from HackerOne's hacktivity REST endpoint.
+    Uses the public /reports REST feed — no GraphQL, no auth required.
     """
     reports = []
-    cursor = None
+    page = 1
     headers = {
-        "Content-Type": "application/json",
+        "Accept": "application/json",
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
     }
 
     print(f"[*] Fetching H1 public hacktivity feed (limit={limit})...")
 
-    simple_query = """
-    query {
-      reports(filter: {reporter: [], disclosed_at__lt: "2099-01-01"}, first: 25) {
-        nodes {
-          id title disclosed_at
-          severity { rating }
-          weakness { name }
-          team { handle }
-        }
-        pageInfo { hasNextPage endCursor }
-      }
-    }
-    """
-
     while len(reports) < limit:
+        params = {
+            "filter[disclosed]": "true",
+            "filter[state][]": "resolved",
+            "page[size]": min(25, limit - len(reports)),
+            "page[number]": page,
+            "sort": "-disclosed_at",
+        }
+        if program:
+            params["filter[program][]"] = program
+
         try:
-            resp = requests.post(
-                H1_WEB_GQL,
+            resp = requests.get(
+                "https://api.hackerone.com/v1/hacktivity",
                 headers=headers,
-                json={"query": simple_query},
+                params=params,
                 timeout=15,
             )
         except requests.RequestException as e:
             print(f"[!] Hacktivity fetch error: {e}")
             break
 
+        if resp.status_code == 401:
+            # Public hacktivity requires no auth but some endpoints may differ
+            print("[!] H1 hacktivity returned 401 — skipping")
+            break
         if not resp.ok:
-            print(f"[!] Hacktivity returned {resp.status_code}")
+            print(f"[!] H1 hacktivity returned {resp.status_code} — skipping")
             break
 
         data = resp.json()
-        if "errors" in data:
-            print(f"[!] GraphQL errors: {data['errors']}")
+        items = data.get("data", [])
+        if not items:
             break
 
-        nodes = data.get("data", {}).get("reports", {}).get("nodes", [])
-        page_info = data.get("data", {}).get("reports", {}).get("pageInfo", {})
+        for item in items:
+            attrs = item.get("attributes", {})
+            rels  = item.get("relationships", {})
+            weakness = (rels.get("weakness", {}).get("data", {}) or {})
+            severity = (rels.get("severity", {}).get("data", {}) or {})
+            team     = (rels.get("team", {}).get("data", {}) or {})
+            reports.append({
+                "source":       "hackerone_public",
+                "id":           item.get("id"),
+                "title":        attrs.get("title", ""),
+                "severity":     severity.get("attributes", {}).get("rating", ""),
+                "weakness":     weakness.get("attributes", {}).get("name", ""),
+                "description":  "",
+                "impact":       "",
+                "program":      team.get("attributes", {}).get("handle", ""),
+                "url":          f"https://hackerone.com/reports/{item.get('id')}",
+                "disclosed_at": attrs.get("disclosed_at", ""),
+            })
 
-        for node in nodes:
-            if node.get("disclosed_at"):
-                reports.append({
-                    "source":      "hackerone_public",
-                    "id":          node.get("id"),
-                    "title":       node.get("title", ""),
-                    "severity":    node.get("severity", {}).get("rating", "") if node.get("severity") else "",
-                    "weakness":    node.get("weakness", {}).get("name", "") if node.get("weakness") else "",
-                    "description": "",
-                    "impact":      "",
-                    "program":     node.get("team", {}).get("handle", "") if node.get("team") else "",
-                    "url":         f"https://hackerone.com/reports/{node.get('id')}",
-                    "disclosed_at": node.get("disclosed_at", ""),
-                })
-
-        if not page_info.get("hasNextPage") or not nodes:
+        meta = data.get("meta", {})
+        if not meta.get("next_page") or len(items) < 25:
             break
 
-        cursor = page_info.get("endCursor")
+        page += 1
         time.sleep(0.5)
 
     print(f"[+] Fetched {len(reports)} public hacktivity reports")
@@ -548,7 +551,7 @@ def main():
         base_url=ZEN_BASE_URL,
     )
 
-    print(f"[*] Using model: {ZEN_MODEL} via OpenCode Zen")
+    print(f"[*] Using model: {ZEN_MODEL} via OpenCode Zen ({ZEN_BASE_URL})")
 
     # --- Fetch reports ---
     all_reports: list[dict] = []
