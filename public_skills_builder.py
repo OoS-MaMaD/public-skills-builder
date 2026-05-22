@@ -21,7 +21,7 @@ Note: HackerOne retired the unauthenticated GraphQL hacktivity endpoint in 2024.
 Usage:
   python public_skills_builder.py [--source h1|h1-public|github|all] [--program HANDLE]
                                    [--vuln-type TYPE] [--limit N] [--out DIR]
-                                   [--chunk-size N] [--debug]
+                                   [--chunk-size N] [--delay N] [--debug]
 """
 
 import os
@@ -49,12 +49,18 @@ H1_API_BASE  = "https://api.hackerone.com/v1"
 ZEN_BASE_URL = "https://opencode.ai/zen/v1"
 ZEN_MODEL    = "opencode/deepseek-v4-flash-free"
 
-# Free flash models typically have 4k–8k combined token budgets.
-# 10 reports x ~60 chars each ≈ 600 tokens input → safe for all free tiers.
-# Use --chunk-size 20 if you switch to a larger model.
 DEFAULT_CHUNK_SIZE = 10
-MAX_DESC_CHARS     = 200   # per report description, fed to LLM
-DEBUG              = False  # set via --debug flag
+DEFAULT_DELAY      = 5    # seconds between LLM calls (avoids RPM limits)
+MAX_DESC_CHARS     = 200
+DEBUG              = False
+
+# Free models available on OpenCode Zen (as of 2026).
+# Switch with: --model opencode/<name>
+FREE_MODELS = [
+    "opencode/deepseek-v4-flash-free",
+    "opencode/big-pickle",
+    "opencode/nemotron-3-super-free",
+]
 
 
 def _api_model(model: str) -> str:
@@ -141,7 +147,7 @@ def fetch_h1_disclosed(api_key: str, program: str | None, limit: int) -> list[di
             print("    It looks like: yourusername-abc12345  (NOT just your username)")
             break
         if resp.status_code == 429:
-            print("[*] Rate limited. Waiting 30s...")
+            print("[*] H1 rate limited. Waiting 30s...")
             time.sleep(30)
             continue
         if not resp.ok:
@@ -180,7 +186,7 @@ def fetch_h1_disclosed(api_key: str, program: str | None, limit: int) -> list[di
 
 
 # ---------------------------------------------------------------------------
-# Source 2: HackerOne public hacktivity via REST /v1/hacktivity
+# Source 2: HackerOne public hacktivity
 # ---------------------------------------------------------------------------
 
 def fetch_h1_hacktivity(api_key: str, limit: int, program: str | None = None) -> list[dict]:
@@ -218,7 +224,7 @@ def fetch_h1_hacktivity(api_key: str, limit: int, program: str | None = None) ->
             print("    'Identifier' field shown after token creation — copy that exactly.")
             break
         if resp.status_code == 429:
-            print("[*] Rate limited. Waiting 30s...")
+            print("[*] H1 rate limited. Waiting 30s...")
             time.sleep(30)
             continue
         if not resp.ok:
@@ -298,7 +304,7 @@ def fetch_github_writeups(limit: int) -> list[dict]:
                     "title":       title,
                     "severity":    "",
                     "weakness":    classify_report(title, ""),
-                    "description": "",  # no description for link-only sources
+                    "description": "",
                     "impact":      "",
                     "program":     "",
                     "url":         link_url,
@@ -337,8 +343,6 @@ def group_by_vuln(reports: list[dict]) -> dict[str, list[dict]]:
 # AI Skill Generation
 # ---------------------------------------------------------------------------
 
-# Ultra-compact prompt — every byte saved here = more room for LLM output.
-# Free flash models have ~4k–8k combined token budgets.
 SKILL_PROMPT = """\
 Senior bug bounty hunter. Write a hunting skill for {vuln_class} from these {count} reports.
 
@@ -362,6 +366,22 @@ Merge these {n} partial {vuln_class} hunting skill drafts into one. Remove dupli
 {combined}
 """
 
+# Error type strings that mean the free quota is fully exhausted for today.
+# Retrying immediately is pointless — bail and tell the user to switch models.
+QUOTA_ERROR_TYPES = {"FreeUsageLimitError", "quota_exceeded", "insufficient_quota"}
+
+
+def _is_quota_error(exc: Exception) -> bool:
+    """Return True if the exception indicates free-tier quota exhaustion."""
+    msg = str(exc)
+    return any(t in msg for t in QUOTA_ERROR_TYPES)
+
+
+def _retry_after(exc: Exception) -> int | None:
+    """Extract Retry-After seconds from the exception message if present."""
+    m = re.search(r'retry.after[^0-9]*([0-9]+)', str(exc), re.I)
+    return int(m.group(1)) if m else None
+
 
 def _build_report_text(reports: list[dict]) -> str:
     lines = []
@@ -378,14 +398,20 @@ def _build_report_text(reports: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _call_zen(client: OpenAI, prompt: str, label: str = "") -> str | None:
+# Module-level flag: set to True when quota is exhausted so we abort fast.
+_QUOTA_EXHAUSTED = False
+
+
+def _call_zen(client: OpenAI, prompt: str, delay: int, label: str = "") -> str | None:
+    global _QUOTA_EXHAUSTED
+    if _QUOTA_EXHAUSTED:
+        return None
+
     api_model = _api_model(ZEN_MODEL)
 
     if DEBUG:
-        chars = len(prompt)
-        # rough token estimate: 1 token ≈ 4 chars for English
-        est_tokens = chars // 4
-        print(f"  [dbg] prompt {chars} chars (~{est_tokens} tokens) for {label}")
+        est_tokens = len(prompt) // 4
+        print(f"  [dbg] {len(prompt)} chars (~{est_tokens} tok) for {label}")
 
     for attempt in range(3):
         try:
@@ -407,50 +433,68 @@ def _call_zen(client: OpenAI, prompt: str, label: str = "") -> str | None:
                 print(f"  [~] Output truncated (finish_reason=length) — still usable")
 
             if DEBUG:
-                print(f"  [dbg] response {len(content)} chars, finish={reason}")
+                print(f"  [dbg] {len(content)} chars back, finish={reason}")
+
+            # Successful call — honour the inter-call delay
+            if delay > 0:
+                time.sleep(delay)
 
             return content
 
         except Exception as e:
-            wait = 20 * (attempt + 1)
+            if _is_quota_error(e):
+                _QUOTA_EXHAUSTED = True
+                print(f"\n  [!] Free quota exhausted for {ZEN_MODEL}")
+                print(f"  [!] Switch to another free model with --model:")
+                for m in FREE_MODELS:
+                    if m != ZEN_MODEL:
+                        print(f"        python public_skills_builder.py --model {m} --source github --vuln-type {label.split()[0] if label else 'xss'}")
+                print(f"  [!] Or wait until tomorrow for the quota to reset.")
+                return None
+
+            # Check for a Retry-After hint
+            ra = _retry_after(e)
+            if ra:
+                print(f"  [!] Rate limited — waiting {ra}s (Retry-After)...")
+                time.sleep(ra + 2)
+                continue
+
+            wait = 30 * (attempt + 1)
             print(f"  [!] Zen error (attempt {attempt+1}): {e} — waiting {wait}s")
             time.sleep(wait)
 
     return None
 
 
-def generate_skill(client: OpenAI, vuln_class: str, reports: list[dict], chunk_size: int) -> str:
-    """
-    Chunk reports into groups of `chunk_size`, call Zen once per chunk,
-    then do a merge pass if more than one chunk.
-    """
+def generate_skill(client: OpenAI, vuln_class: str, reports: list[dict],
+                   chunk_size: int, delay: int) -> str:
+    global _QUOTA_EXHAUSTED
     vname  = vuln_class.replace("-", " ").upper()
     chunks = [reports[i:i+chunk_size] for i in range(0, len(reports), chunk_size)]
 
     partials: list[str] = []
     for idx, chunk in enumerate(chunks, 1):
-        label  = f"{vuln_class} chunk {idx}/{len(chunks)}"
+        if _QUOTA_EXHAUSTED:
+            break
+        label = f"{vuln_class} chunk {idx}/{len(chunks)}"
         if len(chunks) > 1:
             print(f"  [*] Chunk {idx}/{len(chunks)} ({len(chunk)} reports)...")
         prompt = SKILL_PROMPT.format(vuln_class=vname, count=len(chunk),
                                      reports=_build_report_text(chunk))
-        part = _call_zen(client, prompt, label=label)
+        part = _call_zen(client, prompt, delay=delay, label=label)
         if part:
             partials.append(part)
-        if idx < len(chunks):
-            time.sleep(2)
 
     if not partials:
-        return f"# {vuln_class}\n\n*Skill generation failed after all retries.*\n"
+        return f"# {vuln_class}\n\n*Skill generation failed.*\n"
 
     if len(partials) == 1:
         return partials[0]
 
-    # Merge pass — cap combined input to 5000 chars to stay in context
     print(f"  [*] Merging {len(partials)} partial skills...")
     combined = "\n\n---\n\n".join(p[:1200] for p in partials)[:5000]
     prompt   = MERGE_PROMPT.format(n=len(partials), vuln_class=vname, combined=combined)
-    merged   = _call_zen(client, prompt, label=f"{vuln_class} merge")
+    merged   = _call_zen(client, prompt, delay=0, label=f"{vuln_class} merge")
     return merged or partials[0]
 
 
@@ -460,21 +504,15 @@ def generate_skill(client: OpenAI, vuln_class: str, reports: list[dict], chunk_s
 
 def write_skill_file(out_dir: Path, vuln_class: str, content: str,
                      report_count: int, sources: list[str]) -> Path:
-    name = f"hunt-{vuln_class.lower().replace(' ', '-').replace('_', '-')}"
-    desc = (
+    name  = f"hunt-{vuln_class.lower().replace(' ', '-').replace('_', '-')}"
+    desc  = (
         f"Hunting skill for {vuln_class.replace('-', ' ')} vulnerabilities. "
         f"Built from {report_count} public bug bounty reports."
     )[:300]
-
     front = (
-        f"---\n"
-        f"name: {name}\n"
-        f"description: {desc}\n"
-        f"sources: {', '.join(set(sources))}\n"
-        f"report_count: {report_count}\n"
-        f"---\n\n"
+        f"---\nname: {name}\ndescription: {desc}\n"
+        f"sources: {', '.join(set(sources))}\nreport_count: {report_count}\n---\n\n"
     )
-
     skill_dir = out_dir / name
     skill_dir.mkdir(parents=True, exist_ok=True)
     filepath  = skill_dir / "SKILL.md"
@@ -485,23 +523,17 @@ def write_skill_file(out_dir: Path, vuln_class: str, content: str,
 
 def write_index(out_dir: Path, skills: list[dict]):
     lines = [
-        "# Public Bug Bounty Skills",
-        "",
+        "# Public Bug Bounty Skills", "",
         f"Generated from {sum(s['count'] for s in skills)} reports across {len(skills)} vuln classes.",
-        "",
-        "| Skill | Reports | Sources |",
-        "|-------|---------|---------|",
+        "", "| Skill | Reports | Sources |", "|-------|---------|---------|",
     ]
     for s in sorted(skills, key=lambda x: -x["count"]):
         lines.append(f"| [{s['name']}]({s['name']}/SKILL.md) | {s['count']} | {s['sources']} |")
     lines += [
-        "",
-        "## Install to OpenCode",
-        "```bash",
+        "", "## Install to OpenCode", "```bash",
         "cp -r skills/hunt-xss ~/.config/opencode/skills/",
         "# or project-local:",
-        "cp -r skills/hunt-ssrf .opencode/skills/",
-        "```",
+        "cp -r skills/hunt-ssrf .opencode/skills/", "```",
     ]
     (out_dir / "README.md").write_text("\n".join(lines), encoding="utf-8")
     print(f"[+] Index: {out_dir}/README.md")
@@ -522,12 +554,17 @@ def parse_args():
           after you create a token. It is NOT your username — it looks like:
           yourusername-abc12345
 
+        Free models on OpenCode Zen (use --model to switch):
+          opencode/deepseek-v4-flash-free
+          opencode/big-pickle
+          opencode/nemotron-3-super-free
+
         Examples:
           python public_skills_builder.py --source github
           python public_skills_builder.py --source github --vuln-type xss ssrf
-          python public_skills_builder.py --source all
-          python public_skills_builder.py --chunk-size 5   # for very small context models
-          python public_skills_builder.py --debug          # show prompt token estimates
+          python public_skills_builder.py --source github --model opencode/big-pickle
+          python public_skills_builder.py --source all --delay 10
+          python public_skills_builder.py --chunk-size 5 --debug
         """),
     )
     p.add_argument("--source",      choices=["h1", "h1-public", "github", "all"], default="all")
@@ -537,9 +574,11 @@ def parse_args():
     p.add_argument("--out",         default="skills")
     p.add_argument("--min-reports", type=int, default=3)
     p.add_argument("--chunk-size",  type=int, default=DEFAULT_CHUNK_SIZE,
-                   help=f"Reports per LLM call (default {DEFAULT_CHUNK_SIZE}). Lower = safer for small-context models.")
+                   help=f"Reports per LLM call (default {DEFAULT_CHUNK_SIZE})")
+    p.add_argument("--delay",       type=int, default=DEFAULT_DELAY,
+                   help=f"Seconds to wait between LLM calls (default {DEFAULT_DELAY}). Increase if hitting RPM limits.")
     p.add_argument("--model",       default=ZEN_MODEL)
-    p.add_argument("--debug",       action="store_true", help="Print prompt size estimates")
+    p.add_argument("--debug",       action="store_true")
     return p.parse_args()
 
 
@@ -566,13 +605,11 @@ def main():
 
     ZEN_MODEL = args.model
     client    = OpenAI(api_key=opencode_key, base_url=ZEN_BASE_URL)
-    print(f"[*] Using model: {ZEN_MODEL} (API id: {_api_model(ZEN_MODEL)}) via OpenCode Zen")
-    print(f"[*] Chunk size: {args.chunk_size} reports/call")
+    print(f"[*] Model: {ZEN_MODEL}  chunk={args.chunk_size}  delay={args.delay}s")
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- Fetch ---
     all_reports: list[dict] = []
     h1_key = os.getenv("H1_API_KEY", "")
 
@@ -587,14 +624,13 @@ def main():
             if h1_key:
                 all_reports += fetch_h1_hacktivity(h1_key, args.limit, args.program)
             else:
-                print("[!] H1_API_KEY not set — skipping H1 hacktivity")
-                print("    See --help for the correct H1_API_KEY format.")
+                print("[!] H1_API_KEY not set — skipping H1 hacktivity (see --help)")
 
         if args.source in ("github", "all"):
             all_reports += fetch_github_writeups(args.limit // 2)
 
     except KeyboardInterrupt:
-        print("\n[*] Interrupted during fetch. Continuing with collected reports...")
+        print("\n[*] Fetch interrupted. Continuing with collected reports...")
 
     if not all_reports:
         print("[!] No reports collected.")
@@ -606,21 +642,22 @@ def main():
     if args.vuln_type:
         groups = {k: v for k, v in groups.items() if k in args.vuln_type}
 
-    vuln_summary = ", ".join(f"{k}({len(v)})" for k, v in sorted(groups.items(), key=lambda x: -len(x[1])))
-    print(f"[*] Vuln classes: {vuln_summary}")
+    print(f"[*] Vuln classes: {', '.join(f'{k}({len(v)})' for k, v in sorted(groups.items(), key=lambda x: -len(x[1])))}")
 
-    # --- Generate ---
     skills_written: list[dict] = []
     try:
         for vuln_class, reports in sorted(groups.items(), key=lambda x: -len(x[1])):
+            if _QUOTA_EXHAUSTED:
+                print("[!] Quota exhausted — stopping skill generation.")
+                break
             if len(reports) < args.min_reports:
                 print(f"[~] Skipping {vuln_class} ({len(reports)} < {args.min_reports})")
                 continue
 
             n_chunks = max(1, (len(reports) + args.chunk_size - 1) // args.chunk_size)
-            print(f"\n[*] Generating skill: {vuln_class} ({len(reports)} reports, {n_chunks} chunk(s))...")
+            print(f"\n[*] {vuln_class} ({len(reports)} reports, {n_chunks} chunk(s))...")
 
-            content  = generate_skill(client, vuln_class, reports, args.chunk_size)
+            content  = generate_skill(client, vuln_class, reports, args.chunk_size, args.delay)
             sources  = list(set(r["source"].split(":")[0] for r in reports))
             filepath = write_skill_file(out_dir, vuln_class, content, len(reports), sources)
             skills_written.append({
@@ -637,9 +674,14 @@ def main():
     if skills_written:
         write_index(out_dir, skills_written)
         print(f"\n[+] Done. {len(skills_written)} skills in {out_dir}/")
-        print(f"    Install globally: cp -r {out_dir}/* ~/.config/opencode/skills/")
+        print(f"    Install: cp -r {out_dir}/* ~/.config/opencode/skills/")
     else:
         print("[!] No skills generated.")
+        if _QUOTA_EXHAUSTED:
+            print("    Quota was exhausted. Try a different model:")
+            for m in FREE_MODELS:
+                if m != ZEN_MODEL:
+                    print(f"      python public_skills_builder.py --source github --model {m}")
 
 
 if __name__ == "__main__":
