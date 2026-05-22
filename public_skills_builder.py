@@ -9,21 +9,33 @@ Sources:
   2. HackerOne Hacker API /v1/hacktivity  — public disclosed  (H1_API_KEY required)
   3. GitHub writeup collections           — no auth needed
 
-Note: HackerOne retired the unauthenticated GraphQL hacktivity endpoint in 2024.
-      Both H1 sources now require an H1_API_KEY (free H1 account + API token).
-
-      H1_API_KEY format: identifier:token
-        - Go to https://hackerone.com/settings/api_token/edit
-        - Create a token — H1 will show you an 'identifier' string and a 'token' string
-        - The identifier looks like: your_username-abc12345 (NOT your login username alone)
-        - Set H1_API_KEY=your_username-abc12345:the_long_token_string
+LLM backend priority (first found wins):
+  1. --provider flag  (e.g. --provider deepseek  --model deepseek-chat)
+  2. DEEPSEEK_API_KEY env / .env          → api.deepseek.com
+  3. OPENAI_API_KEY env / .env            → api.openai.com
+  4. ~/.local/share/opencode/auth.json    → whichever provider key is stored there
+  5. OPENCODE_API_KEY env / .env          → opencode.ai/zen (free, quota-limited)
 
 Usage:
   python public_skills_builder.py [--source h1|h1-public|github|all] [--program HANDLE]
                                    [--vuln-type TYPE] [--limit N] [--out DIR]
-                                   [--chunk-size N] [--delay N] [--debug]
+                                   [--chunk-size N] [--delay N]
+                                   [--provider PROVIDER] [--model MODEL]
+                                   [--debug]
+
+Provider shortcuts:
+  --provider deepseek   uses DEEPSEEK_API_KEY + api.deepseek.com
+  --provider openai     uses OPENAI_API_KEY   + api.openai.com
+  --provider openrouter uses OPENROUTER_API_KEY + openrouter.ai/api/v1
+  --provider ollama     uses http://localhost:11434/v1  (no key needed)
+  --provider zen        forces OpenCode Zen  (free, quota-limited)
+
+H1_API_KEY format: identifier:token
+  - Go to https://hackerone.com/settings/api_token/edit
+  - The identifier looks like: your_username-abc12345 (NOT just your username)
 """
 
+import json
 import os
 import re
 import sys
@@ -45,54 +57,142 @@ except ImportError:
 # Config
 # ---------------------------------------------------------------------------
 
-H1_API_BASE  = "https://api.hackerone.com/v1"
-ZEN_BASE_URL = "https://opencode.ai/zen/v1"
-ZEN_MODEL    = "opencode/deepseek-v4-flash-free"
+H1_API_BASE = "https://api.hackerone.com/v1"
+
+# Provider registry: name -> (base_url, env_key_name, default_model)
+PROVIDERS = {
+    "deepseek":   ("https://api.deepseek.com/v1",           "DEEPSEEK_API_KEY",   "deepseek-chat"),
+    "openai":     ("https://api.openai.com/v1",              "OPENAI_API_KEY",     "gpt-4o-mini"),
+    "openrouter": ("https://openrouter.ai/api/v1",           "OPENROUTER_API_KEY", "deepseek/deepseek-chat-v3-0324:free"),
+    "ollama":     ("http://localhost:11434/v1",               "",                   "llama3"),
+    "zen":        ("https://opencode.ai/zen/v1",             "OPENCODE_API_KEY",   "deepseek-v4-flash-free"),
+}
+
+# OpenCode stores provider keys here after `opencode auth login` or /connect
+OPENCODE_AUTH_FILE = Path.home() / ".local" / "share" / "opencode" / "auth.json"
+
+# Map provider names in auth.json to our PROVIDERS registry
+AUTH_JSON_PROVIDER_MAP = {
+    "deepseek":   "deepseek",
+    "openai":     "openai",
+    "openrouter": "openrouter",
+    "anthropic":  None,   # not OpenAI-compatible, skip
+}
 
 DEFAULT_CHUNK_SIZE = 10
-DEFAULT_DELAY      = 5    # seconds between LLM calls (avoids RPM limits)
+DEFAULT_DELAY      = 3    # seconds between LLM calls
 MAX_DESC_CHARS     = 200
 DEBUG              = False
 
-# Free models available on OpenCode Zen (as of 2026).
-# Switch with: --model opencode/<name>
-FREE_MODELS = [
-    "opencode/deepseek-v4-flash-free",
-    "opencode/big-pickle",
-    "opencode/nemotron-3-super-free",
-]
+QUOTA_ERROR_TYPES  = {"FreeUsageLimitError", "quota_exceeded", "insufficient_quota"}
+_QUOTA_EXHAUSTED   = False
 
 
-def _api_model(model: str) -> str:
-    return model.removeprefix("opencode/")
+# ---------------------------------------------------------------------------
+# LLM backend resolution
+# ---------------------------------------------------------------------------
+
+def _read_opencode_auth() -> dict:
+    """Parse ~/.local/share/opencode/auth.json and return {provider: api_key}."""
+    if not OPENCODE_AUTH_FILE.exists():
+        return {}
+    try:
+        raw = json.loads(OPENCODE_AUTH_FILE.read_text())
+        result = {}
+        for pname, pdata in raw.items():
+            if isinstance(pdata, dict):
+                key = pdata.get("key") or pdata.get("api_key") or pdata.get("token", "")
+            elif isinstance(pdata, str):
+                key = pdata
+            else:
+                continue
+            if key:
+                result[pname] = key
+        return result
+    except Exception:
+        return {}
 
 
-GITHUB_WRITEUP_REPOS = [
-    ("ngalongc",      "bug-bounty-reference",         "README.md"),
-    ("devanshbatham", "Awesome-Bugbounty-Writeups",    "README.md"),
-    ("djadmin",       "awesome-bug-bounty",            "README.md"),
-]
+def resolve_backend(provider_flag: str | None, model_flag: str | None
+                    ) -> tuple[OpenAI, str, str]:
+    """
+    Returns (OpenAI client, model_name, provider_label).
+    Priority:
+      1. --provider flag
+      2. DEEPSEEK_API_KEY
+      3. OPENAI_API_KEY
+      4. ~/.local/share/opencode/auth.json  (first usable provider)
+      5. OPENCODE_API_KEY  (Zen fallback)
+    """
+    # 1. Explicit --provider flag
+    if provider_flag:
+        pname = provider_flag.lower()
+        if pname not in PROVIDERS:
+            print(f"[!] Unknown provider '{pname}'. Valid: {', '.join(PROVIDERS)}")
+            sys.exit(1)
+        base_url, env_key, default_model = PROVIDERS[pname]
+        model = model_flag or default_model
+        if pname == "ollama":
+            api_key = "ollama"
+        else:
+            api_key = os.getenv(env_key, "")
+            if not api_key and pname != "zen":
+                print(f"[!] {env_key} not set for --provider {pname}")
+                sys.exit(1)
+            if not api_key:
+                api_key = os.getenv("OPENCODE_API_KEY", "")
+            if not api_key:
+                print(f"[!] Neither {env_key} nor OPENCODE_API_KEY is set.")
+                sys.exit(1)
+        print(f"[*] LLM provider: {pname}  model: {model}  base: {base_url}")
+        return OpenAI(api_key=api_key, base_url=base_url), model, pname
 
-VULN_KEYWORDS = {
-    "idor":           ["idor", "insecure direct object", "broken access control", "horizontal privilege"],
-    "ssrf":           ["ssrf", "server-side request forgery", "internal metadata"],
-    "xss":            ["xss", "cross-site scripting", "stored xss", "reflected xss", "dom xss"],
-    "sqli":           ["sql injection", "sqli", "blind sql", "error-based sql"],
-    "rce":            ["rce", "remote code execution", "command injection", "code execution"],
-    "auth-bypass":    ["authentication bypass", "auth bypass", "2fa bypass", "mfa bypass"],
-    "oauth":          ["oauth", "oidc", "jwt", "pkce", "token theft", "open redirect"],
-    "race-condition": ["race condition", "toctou", "double-spend", "concurrent"],
-    "business-logic": ["business logic", "price manipulation", "logic flaw", "workflow bypass"],
-    "graphql":        ["graphql", "introspection", "batching", "alias bypass"],
-    "cache-poison":   ["cache poison", "cache deception", "web cache"],
-    "xxe":            ["xxe", "xml external entity", "xml injection"],
-    "upload":         ["file upload", "unrestricted upload", "webshell", "path traversal"],
-    "ssti":           ["ssti", "server-side template", "template injection"],
-    "csrf":           ["csrf", "cross-site request forgery"],
-    "subdomain":      ["subdomain takeover", "dangling dns", "cname takeover"],
-    "llm-ai":         ["prompt injection", "llm", "ai chatbot", "indirect injection", "ascii smuggling"],
-    "crypto":         ["timing attack", "hmac", "signature bypass", "weak crypto", "replay attack"],
-}
+    # 2. DEEPSEEK_API_KEY in env
+    dk = os.getenv("DEEPSEEK_API_KEY", "")
+    if dk:
+        base_url, _, default_model = PROVIDERS["deepseek"]
+        model = model_flag or default_model
+        print(f"[*] LLM provider: deepseek (env)  model: {model}")
+        return OpenAI(api_key=dk, base_url=base_url), model, "deepseek"
+
+    # 3. OPENAI_API_KEY in env
+    ok = os.getenv("OPENAI_API_KEY", "")
+    if ok:
+        base_url, _, default_model = PROVIDERS["openai"]
+        model = model_flag or default_model
+        print(f"[*] LLM provider: openai (env)  model: {model}")
+        return OpenAI(api_key=ok, base_url=base_url), model, "openai"
+
+    # 4. OpenCode auth.json
+    auth_data = _read_opencode_auth()
+    if auth_data:
+        for pname_raw, api_key in auth_data.items():
+            mapped = AUTH_JSON_PROVIDER_MAP.get(pname_raw)
+            if mapped is None:
+                continue  # skip anthropic etc.
+            base_url, _, default_model = PROVIDERS[mapped]
+            model = model_flag or default_model
+            print(f"[*] LLM provider: {mapped} (from OpenCode auth.json)  model: {model}")
+            return OpenAI(api_key=api_key, base_url=base_url), model, mapped
+
+    # 5. Zen fallback
+    zen_key = os.getenv("OPENCODE_API_KEY", "")
+    if zen_key:
+        base_url, _, default_model = PROVIDERS["zen"]
+        model = model_flag or default_model
+        print(f"[*] LLM provider: zen (fallback)  model: {model}")
+        print(f"    [~] Zen has a daily free quota. For unlimited use, set DEEPSEEK_API_KEY.")
+        return OpenAI(api_key=zen_key, base_url=base_url), model, "zen"
+
+    # Nothing found
+    print("[!] No LLM API key found. Options:")
+    print("    a) Set DEEPSEEK_API_KEY=sk-...  (recommended, cheap, no quota)")
+    print("    b) Set OPENAI_API_KEY=sk-...")
+    print("    c) Set OPENCODE_API_KEY=...  (Zen, free but daily quota)")
+    print("    d) Use --provider ollama  (local, free, no key needed)")
+    print("    e) Run 'opencode' and use /connect to save a provider key,")
+    print(f"       then re-run — keys auto-loaded from {OPENCODE_AUTH_FILE}")
+    sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -113,7 +213,7 @@ def _h1_auth(api_key: str) -> tuple[tuple[str, str], bool]:
 def fetch_h1_disclosed(api_key: str, program: str | None, limit: int) -> list[dict]:
     auth, valid = _h1_auth(api_key)
     if not valid:
-        print("[!] H1_API_KEY must be 'identifier:token' (see --help for format)")
+        print("[!] H1_API_KEY must be 'identifier:token'")
         return []
 
     headers = {"Accept": "application/json"}
@@ -132,26 +232,21 @@ def fetch_h1_disclosed(api_key: str, program: str | None, limit: int) -> list[di
             params["filter[program][]"] = program
 
         try:
-            resp = requests.get(
-                f"{H1_API_BASE}/hackers/me/reports",
-                auth=auth, headers=headers, params=params, timeout=15
-            )
+            resp = requests.get(f"{H1_API_BASE}/hackers/me/reports",
+                                auth=auth, headers=headers, params=params, timeout=15)
         except requests.RequestException as e:
             print(f"[!] H1 API error: {e}")
             break
 
         if resp.status_code == 401:
-            print("[!] H1 auth failed (401). Check H1_API_KEY format:")
-            print("    identifier:token")
-            print("    The 'identifier' is shown on https://hackerone.com/settings/api_token/edit")
-            print("    It looks like: yourusername-abc12345  (NOT just your username)")
+            print("[!] H1 auth failed (401). Check H1_API_KEY=identifier:token")
             break
         if resp.status_code == 429:
             print("[*] H1 rate limited. Waiting 30s...")
             time.sleep(30)
             continue
         if not resp.ok:
-            print(f"[!] H1 API returned {resp.status_code}: {resp.text[:200]}")
+            print(f"[!] H1 API {resp.status_code}: {resp.text[:200]}")
             break
 
         data = resp.json().get("data", [])
@@ -159,10 +254,10 @@ def fetch_h1_disclosed(api_key: str, program: str | None, limit: int) -> list[di
             break
 
         for item in data:
-            attrs  = item.get("attributes", {})
-            rels   = item.get("relationships", {})
-            wk     = (rels.get("weakness", {}).get("data", {}) or {})
-            sv     = (rels.get("severity", {}).get("data", {}) or {})
+            attrs = item.get("attributes", {})
+            rels  = item.get("relationships", {})
+            wk    = (rels.get("weakness", {}).get("data", {}) or {})
+            sv    = (rels.get("severity", {}).get("data", {}) or {})
             reports.append({
                 "source":      "hackerone",
                 "id":          item.get("id"),
@@ -193,7 +288,6 @@ def fetch_h1_hacktivity(api_key: str, limit: int, program: str | None = None) ->
     auth, valid = _h1_auth(api_key)
     if not valid:
         print("[!] H1_API_KEY required for hacktivity (format: identifier:token)")
-        print("    https://hackerone.com/settings/api_token/edit")
         return []
 
     headers = {"Accept": "application/json"}
@@ -210,18 +304,14 @@ def fetch_h1_hacktivity(api_key: str, limit: int, program: str | None = None) ->
             params["filter[program][]"] = program
 
         try:
-            resp = requests.get(
-                f"{H1_API_BASE}/hacktivity",
-                auth=auth, headers=headers, params=params, timeout=20
-            )
+            resp = requests.get(f"{H1_API_BASE}/hacktivity",
+                                auth=auth, headers=headers, params=params, timeout=20)
         except requests.RequestException as e:
             print(f"[!] Hacktivity fetch error: {e}")
             break
 
         if resp.status_code == 401:
-            print("[!] H1 auth failed (401). The identifier in your H1_API_KEY is wrong.")
-            print("    On https://hackerone.com/settings/api_token/edit, look for the")
-            print("    'Identifier' field shown after token creation — copy that exactly.")
+            print("[!] H1 auth failed (401). Check identifier in H1_API_KEY.")
             break
         if resp.status_code == 429:
             print("[*] H1 rate limited. Waiting 30s...")
@@ -268,6 +358,13 @@ def fetch_h1_hacktivity(api_key: str, limit: int, program: str | None = None) ->
 # ---------------------------------------------------------------------------
 # Source 3: GitHub writeup collections
 # ---------------------------------------------------------------------------
+
+GITHUB_WRITEUP_REPOS = [
+    ("ngalongc",      "bug-bounty-reference",         "README.md"),
+    ("devanshbatham", "Awesome-Bugbounty-Writeups",    "README.md"),
+    ("djadmin",       "awesome-bug-bounty",            "README.md"),
+]
+
 
 def fetch_github_writeups(limit: int) -> list[dict]:
     github_token = os.getenv("GITHUB_TOKEN", "")
@@ -322,6 +419,28 @@ def fetch_github_writeups(limit: int) -> list[dict]:
 # Classification
 # ---------------------------------------------------------------------------
 
+VULN_KEYWORDS = {
+    "idor":           ["idor", "insecure direct object", "broken access control", "horizontal privilege"],
+    "ssrf":           ["ssrf", "server-side request forgery", "internal metadata"],
+    "xss":            ["xss", "cross-site scripting", "stored xss", "reflected xss", "dom xss"],
+    "sqli":           ["sql injection", "sqli", "blind sql", "error-based sql"],
+    "rce":            ["rce", "remote code execution", "command injection", "code execution"],
+    "auth-bypass":    ["authentication bypass", "auth bypass", "2fa bypass", "mfa bypass"],
+    "oauth":          ["oauth", "oidc", "jwt", "pkce", "token theft", "open redirect"],
+    "race-condition": ["race condition", "toctou", "double-spend", "concurrent"],
+    "business-logic": ["business logic", "price manipulation", "logic flaw", "workflow bypass"],
+    "graphql":        ["graphql", "introspection", "batching", "alias bypass"],
+    "cache-poison":   ["cache poison", "cache deception", "web cache"],
+    "xxe":            ["xxe", "xml external entity", "xml injection"],
+    "upload":         ["file upload", "unrestricted upload", "webshell", "path traversal"],
+    "ssti":           ["ssti", "server-side template", "template injection"],
+    "csrf":           ["csrf", "cross-site request forgery"],
+    "subdomain":      ["subdomain takeover", "dangling dns", "cname takeover"],
+    "llm-ai":         ["prompt injection", "llm", "ai chatbot", "indirect injection", "ascii smuggling"],
+    "crypto":         ["timing attack", "hmac", "signature bypass", "weak crypto", "replay attack"],
+}
+
+
 def classify_report(title: str, weakness: str) -> str:
     text = (title + " " + weakness).lower()
     for vuln_class, keywords in VULN_KEYWORDS.items():
@@ -366,19 +485,13 @@ Merge these {n} partial {vuln_class} hunting skill drafts into one. Remove dupli
 {combined}
 """
 
-# Error type strings that mean the free quota is fully exhausted for today.
-# Retrying immediately is pointless — bail and tell the user to switch models.
-QUOTA_ERROR_TYPES = {"FreeUsageLimitError", "quota_exceeded", "insufficient_quota"}
-
 
 def _is_quota_error(exc: Exception) -> bool:
-    """Return True if the exception indicates free-tier quota exhaustion."""
     msg = str(exc)
     return any(t in msg for t in QUOTA_ERROR_TYPES)
 
 
 def _retry_after(exc: Exception) -> int | None:
-    """Extract Retry-After seconds from the exception message if present."""
     m = re.search(r'retry.after[^0-9]*([0-9]+)', str(exc), re.I)
     return int(m.group(1)) if m else None
 
@@ -398,25 +511,19 @@ def _build_report_text(reports: list[dict]) -> str:
     return "\n".join(lines)
 
 
-# Module-level flag: set to True when quota is exhausted so we abort fast.
-_QUOTA_EXHAUSTED = False
-
-
-def _call_zen(client: OpenAI, prompt: str, delay: int, label: str = "") -> str | None:
+def _call_llm(client: OpenAI, model: str, prompt: str, delay: int,
+              provider: str, label: str = "") -> str | None:
     global _QUOTA_EXHAUSTED
     if _QUOTA_EXHAUSTED:
         return None
 
-    api_model = _api_model(ZEN_MODEL)
-
     if DEBUG:
-        est_tokens = len(prompt) // 4
-        print(f"  [dbg] {len(prompt)} chars (~{est_tokens} tok) for {label}")
+        print(f"  [dbg] prompt {len(prompt)} chars (~{len(prompt)//4} tokens) for {label}")
 
     for attempt in range(3):
         try:
             resp    = client.chat.completions.create(
-                model=api_model,
+                model=model,
                 max_tokens=4096,
                 messages=[{"role": "user", "content": prompt}],
             )
@@ -435,24 +542,22 @@ def _call_zen(client: OpenAI, prompt: str, delay: int, label: str = "") -> str |
             if DEBUG:
                 print(f"  [dbg] {len(content)} chars back, finish={reason}")
 
-            # Successful call — honour the inter-call delay
             if delay > 0:
                 time.sleep(delay)
-
             return content
 
         except Exception as e:
             if _is_quota_error(e):
                 _QUOTA_EXHAUSTED = True
-                print(f"\n  [!] Free quota exhausted for {ZEN_MODEL}")
-                print(f"  [!] Switch to another free model with --model:")
-                for m in FREE_MODELS:
-                    if m != ZEN_MODEL:
-                        print(f"        python public_skills_builder.py --model {m} --source github --vuln-type {label.split()[0] if label else 'xss'}")
-                print(f"  [!] Or wait until tomorrow for the quota to reset.")
+                print(f"\n  [!] Quota exhausted for {provider}/{model}")
+                if provider == "zen":
+                    print("  [!] Zen daily free quota hit. Use your own provider key instead:")
+                    print("      a) Set DEEPSEEK_API_KEY=sk-...  (cheap, ~$0.001/call)")
+                    print("      b) Set OPENROUTER_API_KEY=... and use free models")
+                    print("      c) --provider ollama  (local, no quota)")
+                    print(f"      d) Keys saved by OpenCode are auto-read from {OPENCODE_AUTH_FILE}")
                 return None
 
-            # Check for a Retry-After hint
             ra = _retry_after(e)
             if ra:
                 print(f"  [!] Rate limited — waiting {ra}s (Retry-After)...")
@@ -460,13 +565,14 @@ def _call_zen(client: OpenAI, prompt: str, delay: int, label: str = "") -> str |
                 continue
 
             wait = 30 * (attempt + 1)
-            print(f"  [!] Zen error (attempt {attempt+1}): {e} — waiting {wait}s")
+            print(f"  [!] LLM error (attempt {attempt+1}): {e} — waiting {wait}s")
             time.sleep(wait)
 
     return None
 
 
-def generate_skill(client: OpenAI, vuln_class: str, reports: list[dict],
+def generate_skill(client: OpenAI, model: str, provider: str,
+                   vuln_class: str, reports: list[dict],
                    chunk_size: int, delay: int) -> str:
     global _QUOTA_EXHAUSTED
     vname  = vuln_class.replace("-", " ").upper()
@@ -481,20 +587,20 @@ def generate_skill(client: OpenAI, vuln_class: str, reports: list[dict],
             print(f"  [*] Chunk {idx}/{len(chunks)} ({len(chunk)} reports)...")
         prompt = SKILL_PROMPT.format(vuln_class=vname, count=len(chunk),
                                      reports=_build_report_text(chunk))
-        part = _call_zen(client, prompt, delay=delay, label=label)
+        part = _call_llm(client, model, prompt, delay=delay, provider=provider, label=label)
         if part:
             partials.append(part)
 
     if not partials:
         return f"# {vuln_class}\n\n*Skill generation failed.*\n"
-
     if len(partials) == 1:
         return partials[0]
 
     print(f"  [*] Merging {len(partials)} partial skills...")
     combined = "\n\n---\n\n".join(p[:1200] for p in partials)[:5000]
     prompt   = MERGE_PROMPT.format(n=len(partials), vuln_class=vname, combined=combined)
-    merged   = _call_zen(client, prompt, delay=0, label=f"{vuln_class} merge")
+    merged   = _call_llm(client, model, prompt, delay=0, provider=provider,
+                         label=f"{vuln_class} merge")
     return merged or partials[0]
 
 
@@ -504,8 +610,8 @@ def generate_skill(client: OpenAI, vuln_class: str, reports: list[dict],
 
 def write_skill_file(out_dir: Path, vuln_class: str, content: str,
                      report_count: int, sources: list[str]) -> Path:
-    name  = f"hunt-{vuln_class.lower().replace(' ', '-').replace('_', '-')}"
-    desc  = (
+    name = f"hunt-{vuln_class.lower().replace(' ', '-').replace('_', '-')}"
+    desc = (
         f"Hunting skill for {vuln_class.replace('-', ' ')} vulnerabilities. "
         f"Built from {report_count} public bug bounty reports."
     )[:300]
@@ -548,23 +654,27 @@ def parse_args():
         description="Build OpenCode agent hunting skills from public bug bounty reports",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""
-        H1_API_KEY format:
-          identifier:token
-          The 'identifier' is shown on https://hackerone.com/settings/api_token/edit
-          after you create a token. It is NOT your username — it looks like:
-          yourusername-abc12345
+        LLM backend auto-detection order:
+          1. --provider flag
+          2. DEEPSEEK_API_KEY env / .env
+          3. OPENAI_API_KEY env / .env
+          4. ~/.local/share/opencode/auth.json  (keys saved by 'opencode /connect')
+          5. OPENCODE_API_KEY  (Zen, free but has a daily quota)
 
-        Free models on OpenCode Zen (use --model to switch):
-          opencode/deepseek-v4-flash-free
-          opencode/big-pickle
-          opencode/nemotron-3-super-free
+        Provider shortcuts for --provider:
+          deepseek   DEEPSEEK_API_KEY  → api.deepseek.com
+          openai     OPENAI_API_KEY    → api.openai.com
+          openrouter OPENROUTER_API_KEY→ openrouter.ai  (has free models)
+          ollama     (no key needed)   → localhost:11434
+          zen        OPENCODE_API_KEY  → opencode.ai/zen  (daily quota)
 
         Examples:
           python public_skills_builder.py --source github
           python public_skills_builder.py --source github --vuln-type xss ssrf
-          python public_skills_builder.py --source github --model opencode/big-pickle
-          python public_skills_builder.py --source all --delay 10
-          python public_skills_builder.py --chunk-size 5 --debug
+          python public_skills_builder.py --provider deepseek --model deepseek-chat
+          python public_skills_builder.py --provider ollama --model llama3
+          python public_skills_builder.py --provider openrouter --model deepseek/deepseek-chat-v3-0324:free
+          python public_skills_builder.py --chunk-size 5 --delay 2 --debug
         """),
     )
     p.add_argument("--source",      choices=["h1", "h1-public", "github", "all"], default="all")
@@ -573,11 +683,11 @@ def parse_args():
     p.add_argument("--limit",       type=int, default=500)
     p.add_argument("--out",         default="skills")
     p.add_argument("--min-reports", type=int, default=3)
-    p.add_argument("--chunk-size",  type=int, default=DEFAULT_CHUNK_SIZE,
-                   help=f"Reports per LLM call (default {DEFAULT_CHUNK_SIZE})")
+    p.add_argument("--chunk-size",  type=int, default=DEFAULT_CHUNK_SIZE)
     p.add_argument("--delay",       type=int, default=DEFAULT_DELAY,
-                   help=f"Seconds to wait between LLM calls (default {DEFAULT_DELAY}). Increase if hitting RPM limits.")
-    p.add_argument("--model",       default=ZEN_MODEL)
+                   help=f"Seconds between LLM calls (default {DEFAULT_DELAY})")
+    p.add_argument("--provider",    help="Force a specific LLM provider (deepseek/openai/openrouter/ollama/zen)")
+    p.add_argument("--model",       help="Override model name for the selected provider")
     p.add_argument("--debug",       action="store_true")
     return p.parse_args()
 
@@ -593,19 +703,13 @@ def load_env():
 
 
 def main():
-    global DEBUG, ZEN_MODEL
+    global DEBUG, _QUOTA_EXHAUSTED
     load_env()
     args  = parse_args()
     DEBUG = args.debug
+    _QUOTA_EXHAUSTED = False
 
-    opencode_key = os.getenv("OPENCODE_API_KEY")
-    if not opencode_key:
-        print("[!] OPENCODE_API_KEY not set. Get yours at https://opencode.ai/zen")
-        sys.exit(1)
-
-    ZEN_MODEL = args.model
-    client    = OpenAI(api_key=opencode_key, base_url=ZEN_BASE_URL)
-    print(f"[*] Model: {ZEN_MODEL}  chunk={args.chunk_size}  delay={args.delay}s")
+    client, model, provider = resolve_backend(args.provider, args.model)
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -624,7 +728,7 @@ def main():
             if h1_key:
                 all_reports += fetch_h1_hacktivity(h1_key, args.limit, args.program)
             else:
-                print("[!] H1_API_KEY not set — skipping H1 hacktivity (see --help)")
+                print("[!] H1_API_KEY not set — skipping H1 hacktivity")
 
         if args.source in ("github", "all"):
             all_reports += fetch_github_writeups(args.limit // 2)
@@ -655,9 +759,10 @@ def main():
                 continue
 
             n_chunks = max(1, (len(reports) + args.chunk_size - 1) // args.chunk_size)
-            print(f"\n[*] {vuln_class} ({len(reports)} reports, {n_chunks} chunk(s))...")
+            print(f"\n[*] Generating skill: {vuln_class} ({len(reports)} reports, {n_chunks} chunk(s))...")
 
-            content  = generate_skill(client, vuln_class, reports, args.chunk_size, args.delay)
+            content  = generate_skill(client, model, provider, vuln_class, reports,
+                                      args.chunk_size, args.delay)
             sources  = list(set(r["source"].split(":")[0] for r in reports))
             filepath = write_skill_file(out_dir, vuln_class, content, len(reports), sources)
             skills_written.append({
@@ -677,11 +782,6 @@ def main():
         print(f"    Install: cp -r {out_dir}/* ~/.config/opencode/skills/")
     else:
         print("[!] No skills generated.")
-        if _QUOTA_EXHAUSTED:
-            print("    Quota was exhausted. Try a different model:")
-            for m in FREE_MODELS:
-                if m != ZEN_MODEL:
-                    print(f"      python public_skills_builder.py --source github --model {m}")
 
 
 if __name__ == "__main__":
